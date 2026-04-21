@@ -188,7 +188,7 @@ def build_trend_figure(frames: dict[str, pd.DataFrame], age_label: str, log_scal
             "height": 480,
             "hovermode": "x unified",
             "margin": {"l": 20, "r": 20, "t": 60, "b": 20},
-            "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+            "legend": {"orientation": "h", "yanchor": "bottom", "y": 0.95, "xanchor": "left", "x": 0, "bgcolor": "rgba(0,0,0,0)"},
             "xaxis_title": "Year",
             "yaxis_title": "Deaths per 100,000",
         }
