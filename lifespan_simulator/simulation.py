@@ -204,29 +204,52 @@ def _compute_percentiles(
     tail_hazard: float,
     survival_at_tail: float,
 ) -> dict[str, float | None]:
+    """Return ages at which the cohort reaches each cumulative-death percentile."""
     percentiles: dict[str, float | None] = {}
 
     for label, death_fraction in PERCENTILES.items():
+        # A death percentile is easier to find on the survival curve as its
+        # complement. For p75 death, the target is 25% survival remaining.
         target_survival = 1.0 - death_fraction
         age_at_percentile: float | None = None
 
         for row in annual_projection.itertuples(index=False):
             if row.survival_start >= target_survival >= row.survival_end:
+                # Within each modeled year the hazard is constant, so survival
+                # follows S(t) = S0 * exp(-hazard * t). Solving for t gives
+                # t = -log(target / S0) / hazard, measured from age_start.
                 if row.hazard == 0:
+                    # A zero-hazard interval is flat. This case can only match
+                    # exactly, so returning the interval end avoids inventing a
+                    # false within-year crossing time.
                     age_at_percentile = float(row.age_end)
                 elif target_survival == row.survival_start:
                     age_at_percentile = float(row.age_start)
                 else:
-                    age_at_percentile = float(row.age_start) - log(target_survival / row.survival_start) / row.hazard
+                    years_after_interval_start = (
+                        -log(target_survival / row.survival_start) / row.hazard
+                    )
+                    age_at_percentile = float(row.age_start) + years_after_interval_start
                 break
 
         if age_at_percentile is None:
+            # After the explicit annual projection, the simulation assumes the
+            # terminal age bucket continues forever at one constant tail hazard.
             if target_survival > survival_at_tail:
+                # The curve is already below the target at the tail boundary.
+                # Clamp to the boundary rather than extrapolating backward.
                 age_at_percentile = float(tail_start_age)
             elif tail_hazard == 0:
+                # With no tail hazard, survival never declines further, so any
+                # unreached percentile is genuinely not reached by the model.
                 age_at_percentile = None
             else:
-                age_at_percentile = float(tail_start_age) - log(target_survival / survival_at_tail) / tail_hazard
+                # Same inverse-survival calculation as above, but t is measured
+                # from the start of the open-ended tail interval.
+                years_after_tail_start = (
+                    -log(target_survival / survival_at_tail) / tail_hazard
+                )
+                age_at_percentile = float(tail_start_age) + years_after_tail_start
 
         percentiles[label] = age_at_percentile
 
@@ -266,4 +289,3 @@ def _build_survival_curve(
         survivals.append(float(tail_survival))
 
     return pd.DataFrame({"age": ages, "survival": survivals})
-

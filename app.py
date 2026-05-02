@@ -18,7 +18,6 @@ from lifespan_simulator.charts import (
 from lifespan_simulator.data import (
     DATA_PATH,
     SIMULATOR_EXCLUDED_CAUSES,
-    get_age_bucket_start,
     get_display_horizon,
     get_simulator_frame,
     load_mortality_data,
@@ -27,6 +26,8 @@ from lifespan_simulator.simulation import build_scenario_map, project_cause_rate
 from lifespan_simulator.trends import build_trend_frame
 
 st.set_page_config(page_title="Lifespan Simulator", layout="wide")
+
+EXPLORER_CAUSE_SELECTION_KEY = "explorer_selected_causes"
 
 
 @st.cache_data(show_spinner=False)
@@ -87,6 +88,15 @@ def minimum_rates_by_code(frame: pd.DataFrame) -> dict[str, float]:
     return frame.groupby("cause_code")["rate"].min().astype(float).to_dict()
 
 
+def default_explorer_causes(raw_frame: pd.DataFrame, age_label: str) -> list[str]:
+    return (
+        raw_frame[(raw_frame["age_label"] == age_label) & (raw_frame["year"] == 2021)]
+        .sort_values("rate", ascending=False)
+        .head(3)["cause_name"]
+        .tolist()
+    )
+
+
 def format_delta(baseline: float, scenario: float) -> str:
     if baseline == inf and scenario == inf:
         return "0.0"
@@ -103,27 +113,35 @@ def format_optional_delta(baseline: float | None, scenario: float | None) -> str
     return format_delta(baseline, scenario)
 
 
-def scenario_reference_age_band(simulator_frame: pd.DataFrame, initial_age: int) -> tuple[int, int, str, bool]:
-    if initial_age <= 89:
-        band_start, band_end = 85, 89
-        is_fallback = False
-    else:
-        band_start = get_age_bucket_start(initial_age)
-        band_end = 95 if band_start == 95 else band_start + 4
-        is_fallback = True
+def available_top_cause_age_bands(simulator_frame: pd.DataFrame, initial_age: int) -> pd.DataFrame:
+    age_bands = (
+        simulator_frame.drop_duplicates("age_start")
+        .sort_values("age_start")[["age_start", "age_end", "age_label"]]
+        .reset_index(drop=True)
+    )
+    band_ends = age_bands["age_end"].fillna(age_bands["age_start"])
+    return age_bands[band_ends >= initial_age].reset_index(drop=True)
 
-    age_label = simulator_frame.loc[simulator_frame["age_start"] == band_start, "age_label"].iloc[0]
-    return band_start, band_end, age_label, is_fallback
+
+def default_top_cause_age_start(age_starts: list[int]) -> int:
+    return 85 if 85 in age_starts else age_starts[0]
+
+
+def age_band_details(simulator_frame: pd.DataFrame, age_start: int) -> tuple[int, int, str]:
+    age_band = simulator_frame.loc[simulator_frame["age_start"] == age_start].iloc[0]
+    age_end = age_start if pd.isna(age_band["age_end"]) else int(age_band["age_end"])
+    return age_start, age_end, str(age_band["age_label"])
 
 
 def scenario_top_causes(
     simulator_frame: pd.DataFrame,
     initial_age: int,
+    age_band_start: int,
     scenario_map: dict[str, dict[str, float | int]],
     limit: int = 5,
 ) -> pd.DataFrame:
     cause_codes = simulator_frame.drop_duplicates("cause_code")["cause_code"].tolist()
-    band_start, band_end, age_label, is_fallback = scenario_reference_age_band(simulator_frame, initial_age)
+    band_start, band_end, age_label = age_band_details(simulator_frame, age_band_start)
     projection = project_cause_rates(
         simulator_frame,
         initial_age,
@@ -140,7 +158,6 @@ def scenario_top_causes(
         .reset_index(drop=True)
     )
     ranked.attrs["age_label"] = age_label
-    ranked.attrs["is_fallback"] = is_fallback
     return ranked
 
 
@@ -169,9 +186,23 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
     age_min = int(simulator_frame["age_start"].min())
     age_max = int(simulator_frame["age_start"].max())
 
-    controls_left, controls_right = st.columns([0.9, 1.9])
+    controls_left, controls_middle, controls_right = st.columns([0.8, 1, 1.8])
     with controls_left:
         initial_age = st.slider("Initial age", min_value=age_min, max_value=age_max, value=35, step=1)
+    top_cause_age_bands = available_top_cause_age_bands(simulator_frame, initial_age)
+    top_cause_age_starts = top_cause_age_bands["age_start"].astype(int).tolist()
+    top_cause_age_label_lookup = top_cause_age_bands.set_index("age_start")["age_label"].to_dict()
+    default_age_start = default_top_cause_age_start(top_cause_age_starts)
+    if st.session_state.get("top_cause_age_start") not in top_cause_age_starts:
+        st.session_state["top_cause_age_start"] = default_age_start
+    with controls_middle:
+        top_cause_age_start = st.selectbox(
+            "Rank top causes by age group",
+            options=top_cause_age_starts,
+            format_func=lambda age_start: top_cause_age_label_lookup[age_start],
+            help="Choose the attained-age band used to rank the automatic top-5 cause lines.",
+            key="top_cause_age_start",
+        )
     with controls_right:
         intervention_causes = st.multiselect(
             "Causes to modify in the scenario",
@@ -215,7 +246,13 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
     scenario_map = build_scenario_map(scenario_inputs)
     baseline_result = simulate_survival(simulator_frame, initial_age)
     scenario_result = simulate_survival(simulator_frame, initial_age, scenario_map)
-    top_scenario_causes = scenario_top_causes(simulator_frame, initial_age, scenario_map, limit=5)
+    top_scenario_causes = scenario_top_causes(
+        simulator_frame,
+        initial_age,
+        top_cause_age_start,
+        scenario_map,
+        limit=5,
+    )
     top_scenario_names = top_scenario_causes["cause_name"].tolist()
     top_scenario_codes = top_scenario_causes["cause_code"].tolist()
 
@@ -242,16 +279,10 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
         if visible_codes:
             cause_projection = project_cause_rates(simulator_frame, initial_age, visible_codes, scenario_map, horizon)
             st.plotly_chart(build_cause_projection_figure(cause_projection), use_container_width=True)
-            if top_scenario_causes.attrs["is_fallback"]:
-                st.caption(
-                    f"The selected initial age is already above 89, so the chart ranks causes using "
-                    f"{top_scenario_causes.attrs['age_label']} instead. Current leaders: {', '.join(top_scenario_names)}."
-                )
-            else:
-                st.caption(
-                    f"The chart shows the top 5 causes in the current scenario for "
-                    f"{top_scenario_causes.attrs['age_label']}: {', '.join(top_scenario_names)}."
-                )
+            st.caption(
+                f"The chart shows the top 5 causes in the current scenario ranked using "
+                f"{top_scenario_causes.attrs['age_label']}: {', '.join(top_scenario_names)}."
+            )
         else:
             st.info("No cause series are available for the current scenario.")
 
@@ -316,17 +347,15 @@ def render_explorer_tab(raw_frame: pd.DataFrame) -> None:
     control_col, toggle_col = st.columns([1.4, 0.6])
     with control_col:
         age_label = st.selectbox("Age group", options=age_labels, index=0)
-        default_causes = (
-            raw_frame[(raw_frame["age_label"] == age_label) & (raw_frame["year"] == 2021)]
-            .sort_values("rate", ascending=False)
-            .head(3)["cause_name"]
-            .tolist()
-        )
+        # Seed the explorer with default causes only once; otherwise Streamlit's
+        # rerun after changing age group would replace the user's selection.
+        if EXPLORER_CAUSE_SELECTION_KEY not in st.session_state:
+            st.session_state[EXPLORER_CAUSE_SELECTION_KEY] = default_explorer_causes(raw_frame, age_label)
         selected_causes = st.multiselect(
             "Causes of death",
             options=all_cause_names,
-            default=default_causes,
             help="The explorer keeps the full source dataset, including aggregate categories.",
+            key=EXPLORER_CAUSE_SELECTION_KEY,
         )
     with toggle_col:
         log_scale = st.toggle("Log y-axis", value=False)
