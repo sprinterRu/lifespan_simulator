@@ -83,6 +83,10 @@ def cause_names_by_code(frame: pd.DataFrame) -> dict[str, str]:
     return frame.drop_duplicates("cause_code").set_index("cause_code")["cause_name"].to_dict()
 
 
+def minimum_rates_by_code(frame: pd.DataFrame) -> dict[str, float]:
+    return frame.groupby("cause_code")["rate"].min().astype(float).to_dict()
+
+
 def format_delta(baseline: float, scenario: float) -> str:
     if baseline == inf and scenario == inf:
         return "0.0"
@@ -161,6 +165,7 @@ def render_intro(simulator_frame: pd.DataFrame) -> None:
 def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
     all_cause_options = cause_options(simulator_frame)
     cause_name_lookup = cause_names_by_code(simulator_frame)
+    cause_minimum_rates = minimum_rates_by_code(simulator_frame)
     age_min = int(simulator_frame["age_start"].min())
     age_max = int(simulator_frame["age_start"].max())
 
@@ -171,7 +176,10 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
         intervention_causes = st.multiselect(
             "Causes to modify in the scenario",
             options=sorted(all_cause_options.keys()),
-            help="Set a future calendar year and replacement rate for each selected cause. Use 0 to model elimination.",
+            help=(
+                "Set a future calendar year and replacement rate for each selected cause. "
+                "The replacement rate defaults to the cause's lowest 2021 rate across age groups."
+            ),
         )
 
     scenario_inputs: dict[str, dict[str, float | int]] = {}
@@ -196,8 +204,9 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
                 replacement_rate = st.number_input(
                     f"Rate after intervention for {cause_name}",
                     min_value=0.0,
-                    value=0.0,
-                    step=0.1,
+                    value=cause_minimum_rates[cause_code],
+                    step=0.01,
+                    format="%.2f",
                     key=f"rate_{cause_code}",
                     label_visibility="collapsed",
                 )
