@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from math import inf
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import streamlit as st
@@ -23,7 +24,10 @@ from lifespan_simulator.data import (
     load_mortality_data,
 )
 from lifespan_simulator.simulation import build_scenario_map, project_cause_rates, project_total_rates, simulate_survival
-from lifespan_simulator.trends import TrendModel, build_trend_frame, build_trend_model
+from lifespan_simulator.trends import build_trend_frame, build_trend_model
+
+if TYPE_CHECKING:
+    from lifespan_simulator.trends import TrendModel
 
 st.set_page_config(page_title="Lifespan Simulator", layout="wide")
 
