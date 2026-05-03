@@ -339,6 +339,48 @@ def format_optional_delta(baseline: float | None, scenario: float | None) -> str
     return format_delta(baseline, scenario)
 
 
+def format_slope_ci(stats: dict[str, object]) -> str:
+    """Format the 95% confidence interval for an explorer trend slope.
+
+    Args:
+        stats: Statistics mapping returned by
+            ``lifespan_simulator.trends.build_trend_frame`` for one selected
+            cause and age group. It must include ``slope_ci_lower`` and
+            ``slope_ci_upper`` values when enough yearly observations are
+            available to fit the regression.
+
+    Returns:
+        Display string in ``[lower, upper]`` form with signed bounds and two
+        decimals. Returns ``"n/a"`` when either bound is missing or NaN.
+    """
+    lower = stats.get("slope_ci_lower")
+    upper = stats.get("slope_ci_upper")
+    if pd.isna(lower) or pd.isna(upper):
+        return "n/a"
+    return f"[{float(lower):+.2f}, {float(upper):+.2f}]"
+
+
+def format_slope_significance(stats: dict[str, object]) -> str:
+    """Describe whether the slope confidence interval excludes zero.
+
+    Args:
+        stats: Statistics mapping returned by
+            ``lifespan_simulator.trends.build_trend_frame`` for one selected
+            cause and age group. It provides ``slope_significant`` after the
+            trend utility compares the slope's 95% confidence interval to zero.
+
+    Returns:
+        ``"Yes"`` when the slope's 95% confidence interval excludes zero,
+        ``"No"`` when the interval includes zero, and ``"n/a"`` when the slope
+        interval could not be estimated.
+    """
+    lower = stats.get("slope_ci_lower")
+    upper = stats.get("slope_ci_upper")
+    if pd.isna(lower) or pd.isna(upper):
+        return "n/a"
+    return "Yes" if bool(stats.get("slope_significant")) else "No"
+
+
 def available_top_cause_age_bands(simulator_frame: pd.DataFrame, initial_age: int) -> pd.DataFrame:
     """Filter age bands that can be used to rank top scenario causes.
 
@@ -697,13 +739,18 @@ def render_explorer_tab(raw_frame: pd.DataFrame) -> None:
             {
                 "Cause": cause_name,
                 "Slope per year": f"{stats['slope']:+.2f}",
+                "Slope 95% CI": format_slope_ci(stats),
+                "Slope excludes 0": format_slope_significance(stats),
                 "R2": f"{stats['r_squared']:.3f}",
                 "2021 rate": f"{trend_frame.loc[trend_frame['year'].idxmax(), 'rate']:.2f}",
             }
         )
 
     st.plotly_chart(build_trend_figure(trend_frames, age_label, log_scale), use_container_width=True)
-    st.caption("Confidence intervals show the 95% interval around the fitted mean trend line, not a forecast interval.")
+    st.caption(
+        "Chart bands show the 95% interval around the fitted mean trend line, not a forecast interval. "
+        "A slope is marked as excluding 0 when its 95% confidence interval does not include zero."
+    )
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
 

@@ -42,7 +42,23 @@ T_CRITICAL_95 = {
 
 
 def build_trend_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Fit a linear trend with a 95% confidence interval for the mean rate."""
+    """Fit a linear mortality-rate trend and regression summary statistics.
+
+    Args:
+        frame: Mortality DataFrame for one selected cause and one selected age
+            group. It is sliced in ``app.render_explorer_tab`` from the complete
+            normalized mortality dataset and must include ``year`` and ``rate``
+            columns.
+
+    Returns:
+        A pair containing the ordered trend DataFrame and a statistics mapping.
+        The DataFrame preserves the input rows sorted by year and adds
+        ``trend``, ``trend_lower``, and ``trend_upper`` columns for the fitted
+        mean line and its 95% confidence interval. The stats mapping contains
+        ``slope``, ``intercept``, ``r_squared``, ``slope_ci_lower``,
+        ``slope_ci_upper``, and ``slope_significant``. ``slope_significant`` is
+        true when the 95% confidence interval for the slope excludes zero.
+    """
     ordered = frame.sort_values("year").copy()
     x = ordered["year"].to_numpy(dtype=float)
     y = ordered["rate"].to_numpy(dtype=float)
@@ -52,7 +68,14 @@ def build_trend_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]
         ordered["trend"] = y
         ordered["trend_lower"] = y
         ordered["trend_upper"] = y
-        return ordered, {"slope": float("nan"), "r_squared": float("nan")}
+        return ordered, {
+            "slope": float("nan"),
+            "intercept": float("nan"),
+            "r_squared": float("nan"),
+            "slope_ci_lower": float("nan"),
+            "slope_ci_upper": float("nan"),
+            "slope_significant": False,
+        }
 
     design = np.column_stack([np.ones_like(x), x])
     coefficients, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
@@ -61,18 +84,26 @@ def build_trend_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]
     dof = n_obs - 2
     rss = float(np.sum(residuals**2))
     t_critical = T_CRITICAL_95.get(dof, 1.96)
+    x_mean = float(np.mean(x))
+    sxx = float(np.sum((x - x_mean) ** 2))
+    slope = float(coefficients[1])
 
-    if dof <= 0 or np.isclose(rss, 0.0):
+    if dof <= 0 or np.isclose(rss, 0.0) or np.isclose(sxx, 0.0):
         lower = fitted
         upper = fitted
+        slope_ci_lower = slope
+        slope_ci_upper = slope
     else:
         sigma = np.sqrt(rss / dof)
-        x_mean = float(np.mean(x))
-        sxx = float(np.sum((x - x_mean) ** 2))
         se_mean = sigma * np.sqrt((1 / n_obs) + ((x - x_mean) ** 2) / sxx)
         margin = t_critical * se_mean
         lower = np.clip(fitted - margin, a_min=0.0, a_max=None)
         upper = fitted + margin
+        # In simple linear regression, Var(slope) = MSE / Sxx. The same
+        # t-critical value used for the mean confidence band gives the 95% CI.
+        slope_margin = t_critical * np.sqrt((rss / dof) / sxx)
+        slope_ci_lower = slope - slope_margin
+        slope_ci_upper = slope + slope_margin
 
     total_sum_squares = float(np.sum((y - np.mean(y)) ** 2))
     if np.isclose(total_sum_squares, 0.0):
@@ -84,5 +115,11 @@ def build_trend_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]
     ordered["trend_lower"] = lower
     ordered["trend_upper"] = upper
 
-    return ordered, {"slope": float(coefficients[1]), "intercept": float(coefficients[0]), "r_squared": r_squared}
-
+    return ordered, {
+        "slope": slope,
+        "intercept": float(coefficients[0]),
+        "r_squared": r_squared,
+        "slope_ci_lower": float(slope_ci_lower),
+        "slope_ci_upper": float(slope_ci_upper),
+        "slope_significant": bool(slope_ci_lower > 0 or slope_ci_upper < 0),
+    }
