@@ -23,7 +23,7 @@ from lifespan_simulator.data import (
     load_mortality_data,
 )
 from lifespan_simulator.simulation import build_scenario_map, project_cause_rates, project_total_rates, simulate_survival
-from lifespan_simulator.trends import build_trend_frame
+from lifespan_simulator.trends import TrendModel, build_trend_frame, build_trend_model
 
 st.set_page_config(page_title="Lifespan Simulator", layout="wide")
 
@@ -44,6 +44,25 @@ def load_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     raw = load_mortality_data(DATA_PATH)
     return raw, get_simulator_frame(raw)
+
+
+@st.cache_data(show_spinner=False)
+def load_trend_model(raw_frame: pd.DataFrame, simulator_frame: pd.DataFrame) -> TrendModel:
+    """Estimate significant historical trends for the simulator cause set.
+
+    Args:
+        raw_frame: Complete normalized mortality dataset returned by
+            :func:`load_frames`. It provides all 2011-2021 observations used to
+            estimate cause-age slopes.
+        simulator_frame: 2021 non-overlapping simulator DataFrame returned by
+            :func:`load_frames`. It defines the age buckets and causes that can
+            contribute to survival totals.
+
+    Returns:
+        :class:`lifespan_simulator.trends.TrendModel` with one slope entry per
+        simulator cause-age pair and summary counts for the UI note.
+    """
+    return build_trend_model(raw_frame, simulator_frame)
 
 
 def apply_custom_styles() -> None:
@@ -446,6 +465,7 @@ def scenario_top_causes(
     initial_age: int,
     age_band_start: int,
     scenario_map: dict[str, dict[str, float | int]],
+    trend_table: dict[int, dict[str, float]] | None = None,
     limit: int = 5,
 ) -> pd.DataFrame:
     """Rank causes by average scenario mortality within a chosen age band.
@@ -462,6 +482,9 @@ def scenario_top_causes(
         scenario_map: Normalized intervention map returned by
             ``build_scenario_map`` from the current manual or loaded scenario
             controls.
+        trend_table: Optional significant-slope lookup from
+            :class:`lifespan_simulator.trends.TrendModel`. When present, cause
+            rates used for ranking include historical trend adjustments.
         limit: Maximum number of causes to return. The app uses the default of
             five to choose the automatic chart lines.
 
@@ -479,6 +502,7 @@ def scenario_top_causes(
         cause_codes,
         scenario_map,
         max_age=max(initial_age, band_end),
+        trend_table=trend_table,
     )
     band_projection = projection[(projection["age"] >= band_start) & (projection["age"] <= band_end)].copy()
     ranked = (
@@ -502,22 +526,24 @@ def render_intro(simulator_frame: pd.DataFrame) -> None:
     """
     st.title("Lifespan Simulator")
     st.caption(
-        "Male mortality in Spain, 2011-2021. The simulator tab keeps the 2021 age-specific rates fixed unless "
-        "you override selected causes in future calendar years."
+        "Male mortality in Spain, 2011-2021. The simulator can apply statistically significant historical trends "
+        "to future cause-specific rates, and lets you override selected causes in future calendar years."
     )
     with st.expander("Model assumptions used by the app", expanded=False):
         st.markdown(
             f"""
-            - The simulator uses the 2021 age-specific mortality schedule only.
+            - The simulator starts from the 2021 age-specific mortality schedule.
+            - The simulator tab has a default-on control for applying statistically significant 2011-2021 cause-age trends to future rates.
+            - Trend-adjusted rates use linear changes per 100,000 population and are floored at zero.
             - Mortality is treated as a constant annual hazard within each age bucket.
-            - The `95 years or over` bucket remains flat after age 94.
+            - The source `95 years or over` bucket is reused for attained ages 95+; with trends enabled, rates are projected annually through the explicit trend horizon before the tail hazard is frozen.
             - The simulator works with {simulator_frame['cause_code'].nunique()} mutually exclusive cause series after excluding {len(SIMULATOR_EXCLUDED_CAUSES)} roll-up series that would otherwise double-count deaths.
             - The historical explorer keeps the full dataset, including aggregate categories, because it does not sum them.
             """
         )
 
 
-def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
+def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel) -> None:
     """Render the simulator workflow and all scenario-dependent outputs.
 
     Args:
@@ -527,6 +553,9 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
             to populate controls, parse loaded interventions, build scenario
             maps, run baseline and scenario simulations, and draw the simulator
             charts and tables.
+        trend_model: Significant 2011-2021 cause-age trend model returned by
+            :func:`load_trend_model`. The simulator uses its slope table when
+            the trend toggle is enabled.
     """
     all_cause_options = cause_options(simulator_frame)
     cause_name_lookup = cause_names_by_code(simulator_frame)
@@ -537,6 +566,22 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
     controls_left, controls_middle, controls_right = st.columns([0.8, 1, 1.8])
     with controls_left:
         initial_age = st.slider("Initial age", min_value=age_min, max_value=age_max, value=35, step=1)
+        use_trends = st.toggle(
+            "Use significant historical mortality trends",
+            value=True,
+            help=(
+                "When enabled, future rates use significant 2011-2021 linear cause-age trends "
+                "unless an active intervention overrides that cause."
+            ),
+        )
+        if use_trends:
+            st.caption(
+                f"Using {trend_model.significant_count} of {trend_model.total_count} significant cause-age trends; "
+                "rates are floored at 0."
+            )
+        else:
+            st.caption("Using fixed 2021 cause-age rates unless an intervention overrides them.")
+    active_trend_table = trend_model.slope_table if use_trends else None
     top_cause_age_bands = available_top_cause_age_bands(simulator_frame, initial_age)
     top_cause_age_starts = top_cause_age_bands["age_start"].astype(int).tolist()
     top_cause_age_label_lookup = top_cause_age_bands.set_index("age_start")["age_label"].to_dict()
@@ -608,13 +653,19 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
             scenario_inputs[cause_code] = {"effective_year": effective_year, "rate": replacement_rate}
 
     scenario_map = build_scenario_map(scenario_inputs)
-    baseline_result = simulate_survival(simulator_frame, initial_age)
-    scenario_result = simulate_survival(simulator_frame, initial_age, scenario_map)
+    baseline_result = simulate_survival(simulator_frame, initial_age, trend_table=active_trend_table)
+    scenario_result = simulate_survival(
+        simulator_frame,
+        initial_age,
+        scenario_map,
+        trend_table=active_trend_table,
+    )
     top_scenario_causes = scenario_top_causes(
         simulator_frame,
         initial_age,
         top_cause_age_start,
         scenario_map,
+        trend_table=active_trend_table,
         limit=5,
     )
     top_scenario_names = top_scenario_causes["cause_name"].tolist()
@@ -641,7 +692,14 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
     chart_col, total_col = st.columns([1.45, 1])
     with chart_col:
         if visible_codes:
-            cause_projection = project_cause_rates(simulator_frame, initial_age, visible_codes, scenario_map, horizon)
+            cause_projection = project_cause_rates(
+                simulator_frame,
+                initial_age,
+                visible_codes,
+                scenario_map,
+                horizon,
+                trend_table=active_trend_table,
+            )
             st.plotly_chart(build_cause_projection_figure(cause_projection), use_container_width=True)
             st.caption(
                 f"The chart shows the top 5 causes in the current scenario ranked using "
@@ -651,7 +709,13 @@ def render_simulator_tab(simulator_frame: pd.DataFrame) -> None:
             st.info("No cause series are available for the current scenario.")
 
     with total_col:
-        total_projection = project_total_rates(simulator_frame, initial_age, scenario_map, horizon)
+        total_projection = project_total_rates(
+            simulator_frame,
+            initial_age,
+            scenario_map,
+            horizon,
+            trend_table=active_trend_table,
+        )
         st.plotly_chart(build_total_rate_figure(total_projection), use_container_width=True)
 
     survival_col, table_col = st.columns([1.35, 0.85])
@@ -758,10 +822,11 @@ def main() -> None:
     """Run the Streamlit app from initial data load through tab rendering."""
     apply_custom_styles()
     raw_frame, simulator_frame = load_frames()
+    trend_model = load_trend_model(raw_frame, simulator_frame)
     render_intro(simulator_frame)
     simulator_tab, explorer_tab = st.tabs(["Simulator", "Mortality Rates Progress Explorer"])
     with simulator_tab:
-        render_simulator_tab(simulator_frame)
+        render_simulator_tab(simulator_frame, trend_model)
     with explorer_tab:
         render_explorer_tab(raw_frame)
 

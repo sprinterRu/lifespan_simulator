@@ -31,6 +31,7 @@ PERCENTILES = {
     "p95": 0.95,
     "p99": 0.99,
 }
+TrendTable = dict[int, dict[str, float]]
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,7 @@ def _resolve_rate(
     cause_code: str,
     rate_table: dict[int, dict[str, float]],
     scenario_map: dict[str, dict[str, float | int]],
+    trend_table: TrendTable | None = None,
 ) -> float:
     """Return the mortality rate that applies for one cause at one age/year.
 
@@ -158,17 +160,28 @@ def _resolve_rate(
         scenario_map: Normalized intervention map returned by
             :func:`build_scenario_map`. If it contains ``cause_code`` and
             ``calendar_year`` is greater than or equal to that intervention's
-            ``effective_year``, the scenario replacement rate is used.
+            ``effective_year``, the scenario replacement rate is used before
+            any historical trend adjustment.
+        trend_table: Optional nested lookup returned by
+            ``lifespan_simulator.trends.build_trend_model``. When present, it
+            supplies significant linear annual slopes by age bucket and cause
+            code. Non-significant cause-age trends are represented as ``0.0``.
 
     Returns:
-        The applicable mortality rate per 100,000 population. It is either the
-        2021 baseline rate from ``rate_table`` or the scenario replacement rate.
+        The applicable mortality rate per 100,000 population. Interventions
+        override all other behavior. Otherwise, if a trend table is supplied,
+        the 2021 baseline rate is adjusted by ``slope * (calendar_year - 2021)``
+        and floored at zero. Without a trend table, the fixed 2021 baseline
+        rate is returned.
     """
     bucket_start = get_age_bucket_start(age)
     baseline_rate = float(rate_table[bucket_start].get(cause_code, 0.0))
     scenario = scenario_map.get(cause_code)
     if scenario and calendar_year >= int(scenario["effective_year"]):
         return float(scenario["rate"])
+    if trend_table is not None:
+        slope = float(trend_table.get(bucket_start, {}).get(cause_code, 0.0))
+        return max(0.0, baseline_rate + slope * (calendar_year - START_YEAR))
     return baseline_rate
 
 
@@ -179,6 +192,7 @@ def project_cause_rates(
     scenario_map: dict[str, dict[str, float | int]],
     max_age: int,
     start_year: int = START_YEAR,
+    trend_table: TrendTable | None = None,
 ) -> pd.DataFrame:
     """Project baseline and scenario rates by attained age for selected causes.
 
@@ -198,12 +212,18 @@ def project_cause_rates(
             of the age band being used for top-cause ranking.
         start_year: Calendar year assigned to ``initial_age``. The default is
             :data:`START_YEAR`, matching the 2021 baseline mortality schedule.
+        trend_table: Optional significant-slope lookup from
+            ``build_trend_model``. When present, both the no-intervention
+            baseline projection and scenario projection include historical
+            trend adjustments before scenario interventions are applied.
 
     Returns:
         DataFrame with one row per projected age and selected cause. Columns
         include ``age``, ``calendar_year``, ``cause_code``, ``cause_name``,
-        ``baseline_rate``, and ``scenario_rate``. Chart builders consume this
-        frame directly.
+        ``baseline_rate``, and ``scenario_rate``. ``baseline_rate`` means
+        "without active interventions"; it can still include trend adjustments
+        when ``trend_table`` is supplied. Chart builders consume this frame
+        directly.
     """
     rate_table, cause_names = _build_rate_table(frame)
     rows: list[dict[str, Any]] = []
@@ -211,15 +231,28 @@ def project_cause_rates(
     for age in range(initial_age, max_age + 1):
         calendar_year = start_year + (age - initial_age)
         for cause_code in selected_causes:
-            bucket_start = get_age_bucket_start(age)
             rows.append(
                 {
                     "age": age,
                     "calendar_year": calendar_year,
                     "cause_code": cause_code,
                     "cause_name": cause_names[cause_code],
-                    "baseline_rate": float(rate_table[bucket_start].get(cause_code, 0.0)),
-                    "scenario_rate": _resolve_rate(age, calendar_year, cause_code, rate_table, scenario_map),
+                    "baseline_rate": _resolve_rate(
+                        age,
+                        calendar_year,
+                        cause_code,
+                        rate_table,
+                        {},
+                        trend_table,
+                    ),
+                    "scenario_rate": _resolve_rate(
+                        age,
+                        calendar_year,
+                        cause_code,
+                        rate_table,
+                        scenario_map,
+                        trend_table,
+                    ),
                 }
             )
 
@@ -232,6 +265,7 @@ def project_total_rates(
     scenario_map: dict[str, dict[str, float | int]],
     max_age: int,
     start_year: int = START_YEAR,
+    trend_table: TrendTable | None = None,
 ) -> pd.DataFrame:
     """Project total baseline and scenario mortality rates by attained age.
 
@@ -250,12 +284,17 @@ def project_total_rates(
         start_year: Calendar year assigned to ``initial_age``. It defaults to
             :data:`START_YEAR`, the same year used to filter the simulator
             mortality frame.
+        trend_table: Optional significant-slope lookup from
+            ``build_trend_model``. When present, both total series include
+            historical trend adjustments, and the scenario series additionally
+            applies active interventions.
 
     Returns:
         DataFrame with one row per projected attained age. It contains
         ``age``, ``calendar_year``, ``baseline_rate`` summed across all
-        simulator causes, and ``scenario_rate`` after applying any active
-        interventions.
+        simulator causes without interventions, and ``scenario_rate`` after
+        applying any active interventions. Either series can include trend
+        adjustments when ``trend_table`` is supplied.
     """
     rate_table, cause_names = _build_rate_table(frame)
     cause_codes = sorted(cause_names)
@@ -263,10 +302,11 @@ def project_total_rates(
 
     for age in range(initial_age, max_age + 1):
         calendar_year = start_year + (age - initial_age)
-        bucket_start = get_age_bucket_start(age)
-        baseline_total = sum(float(rate_table[bucket_start].get(code, 0.0)) for code in cause_codes)
+        baseline_total = sum(
+            _resolve_rate(age, calendar_year, code, rate_table, {}, trend_table) for code in cause_codes
+        )
         scenario_total = sum(
-            _resolve_rate(age, calendar_year, code, rate_table, scenario_map) for code in cause_codes
+            _resolve_rate(age, calendar_year, code, rate_table, scenario_map, trend_table) for code in cause_codes
         )
         rows.append(
             {
@@ -285,6 +325,7 @@ def simulate_survival(
     initial_age: int,
     scenario_map: dict[str, dict[str, float | int]] | None = None,
     start_year: int = START_YEAR,
+    trend_table: TrendTable | None = None,
 ) -> SimulationResult:
     """Simulate cohort survival under piecewise-constant annual hazards.
 
@@ -302,6 +343,10 @@ def simulate_survival(
         start_year: Calendar year assigned to ``initial_age``. The default is
             :data:`START_YEAR`, which matches the source year used for baseline
             rates in the simulator frame.
+        trend_table: Optional significant-slope lookup from
+            ``build_trend_model``. When present, cause rates without active
+            interventions are projected as linear changes from the 2021
+            baseline and floored at zero.
 
     Returns:
         A :class:`SimulationResult` containing the annual survival projection,
@@ -314,7 +359,11 @@ def simulate_survival(
     cause_codes = sorted(cause_names)
 
     last_change_year = max([start_year] + [int(config["effective_year"]) for config in scenario_map.values()])
-    tail_start_age = max(95, initial_age + max(0, last_change_year - start_year))
+    latest_intervention_age = initial_age + max(0, last_change_year - start_year)
+    if trend_table is None:
+        tail_start_age = max(95, latest_intervention_age)
+    else:
+        tail_start_age = max(130, latest_intervention_age)
 
     rows: list[dict[str, float | int]] = []
     survival = 1.0
@@ -322,7 +371,10 @@ def simulate_survival(
 
     for age in range(initial_age, tail_start_age):
         calendar_year = start_year + (age - initial_age)
-        total_rate = sum(_resolve_rate(age, calendar_year, code, rate_table, scenario_map) for code in cause_codes)
+        total_rate = sum(
+            _resolve_rate(age, calendar_year, code, rate_table, scenario_map, trend_table)
+            for code in cause_codes
+        )
         hazard = total_rate / RATE_SCALE
         next_survival = survival * exp(-hazard)
         interval_expectation = survival if hazard == 0 else survival * (1 - exp(-hazard)) / hazard
@@ -343,7 +395,8 @@ def simulate_survival(
 
     tail_calendar_year = start_year + (tail_start_age - initial_age)
     tail_total_rate = sum(
-        _resolve_rate(tail_start_age, tail_calendar_year, code, rate_table, scenario_map) for code in cause_codes
+        _resolve_rate(tail_start_age, tail_calendar_year, code, rate_table, scenario_map, trend_table)
+        for code in cause_codes
     )
     tail_hazard = tail_total_rate / RATE_SCALE
 
@@ -495,7 +548,7 @@ def _build_survival_curve(
 
     finite_percentiles = [age for age in percentiles.values() if age is not None]
     curve_max_age = int(max([tail_start_age + 12, *(finite_percentiles or [tail_start_age + 12])]))
-    curve_max_age = min(curve_max_age + 2, 130)
+    curve_max_age = min(curve_max_age + 2, max(130, tail_start_age + 20))
 
     for age in range(max(tail_start_age + 1, int(ages[-1]) + 1), curve_max_age + 1):
         years_in_tail = age - tail_start_age
