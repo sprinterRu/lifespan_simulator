@@ -22,6 +22,11 @@ START_YEAR = 2021
 # Dividing by this value converts a rate into the annual hazard used by the
 # exponential survival model.
 RATE_SCALE = 100_000.0
+# With trend dampening enabled, fitted annual slopes are applied fully for the
+# first projection window, linearly tapered to zero during the second window,
+# and then held fixed.
+TREND_FULL_YEARS = 15
+TREND_TAPER_YEARS = 15
 # Labels are death-distribution percentiles. For example, p75 is the age by
 # which 75% of the synthetic cohort has died.
 PERCENTILES = {
@@ -143,6 +148,7 @@ def _resolve_rate(
     rate_table: dict[int, dict[str, float]],
     scenario_map: dict[str, dict[str, float | int]],
     trend_table: TrendTable | None = None,
+    trend_dampening: bool = False,
 ) -> float:
     """Return the mortality rate that applies for one cause at one age/year.
 
@@ -166,13 +172,15 @@ def _resolve_rate(
             ``lifespan_simulator.trends.build_trend_model``. When present, it
             supplies significant linear annual slopes by age bucket and cause
             code. Non-significant cause-age trends are represented as ``0.0``.
+        trend_dampening: When true, the fitted slope is applied fully for
+            :data:`TREND_FULL_YEARS`, tapered to zero over
+            :data:`TREND_TAPER_YEARS`, and then held fixed.
 
     Returns:
         The applicable mortality rate per 100,000 population. Interventions
         override all other behavior. Otherwise, if a trend table is supplied,
-        the 2021 baseline rate is adjusted by ``slope * (calendar_year - 2021)``
-        and floored at zero. Without a trend table, the fixed 2021 baseline
-        rate is returned.
+        the 2021 baseline rate is adjusted by the fitted slope and floored at
+        zero. Without a trend table, the fixed 2021 baseline rate is returned.
     """
     bucket_start = get_age_bucket_start(age)
     baseline_rate = float(rate_table[bucket_start].get(cause_code, 0.0))
@@ -181,8 +189,39 @@ def _resolve_rate(
         return float(scenario["rate"])
     if trend_table is not None:
         slope = float(trend_table.get(bucket_start, {}).get(cause_code, 0.0))
-        return max(0.0, baseline_rate + slope * (calendar_year - START_YEAR))
+        years_since_start = calendar_year - START_YEAR
+        trend_years = (
+            dampened_trend_years(years_since_start)
+            if trend_dampening
+            else float(years_since_start)
+        )
+        return max(0.0, baseline_rate + slope * trend_years)
     return baseline_rate
+
+
+def dampened_trend_years(
+    years_since_start: int | float,
+    full_years: int = TREND_FULL_YEARS,
+    taper_years: int = TREND_TAPER_YEARS,
+) -> float:
+    """Return the cumulative trend exposure after linear slope tapering.
+
+    A fitted annual slope is applied at full strength through ``full_years``.
+    During the following ``taper_years``, the marginal slope contribution fades
+    linearly to zero. After that, the cumulative trend contribution is frozen.
+    """
+    years = float(years_since_start)
+    if years <= full_years:
+        return years
+    if taper_years <= 0:
+        return float(full_years)
+
+    taper_elapsed = min(years - full_years, taper_years)
+    dampened_years = full_years + taper_elapsed - (taper_elapsed**2 / (2 * taper_years))
+
+    if years > full_years + taper_years:
+        return full_years + (taper_years / 2)
+    return dampened_years
 
 
 def project_cause_rates(
@@ -193,6 +232,7 @@ def project_cause_rates(
     max_age: int,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
+    trend_dampening: bool = False,
 ) -> pd.DataFrame:
     """Project baseline and scenario rates by attained age for selected causes.
 
@@ -216,6 +256,8 @@ def project_cause_rates(
             ``build_trend_model``. When present, both the no-intervention
             baseline projection and scenario projection include historical
             trend adjustments before scenario interventions are applied.
+        trend_dampening: When true, trend adjustments are tapered and then
+            frozen instead of extrapolating linearly forever.
 
     Returns:
         DataFrame with one row per projected age and selected cause. Columns
@@ -244,6 +286,7 @@ def project_cause_rates(
                         rate_table,
                         {},
                         trend_table,
+                        trend_dampening,
                     ),
                     "scenario_rate": _resolve_rate(
                         age,
@@ -252,6 +295,7 @@ def project_cause_rates(
                         rate_table,
                         scenario_map,
                         trend_table,
+                        trend_dampening,
                     ),
                 }
             )
@@ -266,6 +310,7 @@ def project_total_rates(
     max_age: int,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
+    trend_dampening: bool = False,
 ) -> pd.DataFrame:
     """Project total baseline and scenario mortality rates by attained age.
 
@@ -288,6 +333,8 @@ def project_total_rates(
             ``build_trend_model``. When present, both total series include
             historical trend adjustments, and the scenario series additionally
             applies active interventions.
+        trend_dampening: When true, trend adjustments are tapered and then
+            frozen instead of extrapolating linearly forever.
 
     Returns:
         DataFrame with one row per projected attained age. It contains
@@ -303,10 +350,12 @@ def project_total_rates(
     for age in range(initial_age, max_age + 1):
         calendar_year = start_year + (age - initial_age)
         baseline_total = sum(
-            _resolve_rate(age, calendar_year, code, rate_table, {}, trend_table) for code in cause_codes
+            _resolve_rate(age, calendar_year, code, rate_table, {}, trend_table, trend_dampening)
+            for code in cause_codes
         )
         scenario_total = sum(
-            _resolve_rate(age, calendar_year, code, rate_table, scenario_map, trend_table) for code in cause_codes
+            _resolve_rate(age, calendar_year, code, rate_table, scenario_map, trend_table, trend_dampening)
+            for code in cause_codes
         )
         rows.append(
             {
@@ -326,6 +375,7 @@ def simulate_survival(
     scenario_map: dict[str, dict[str, float | int]] | None = None,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
+    trend_dampening: bool = False,
 ) -> SimulationResult:
     """Simulate cohort survival under piecewise-constant annual hazards.
 
@@ -347,6 +397,8 @@ def simulate_survival(
             ``build_trend_model``. When present, cause rates without active
             interventions are projected as linear changes from the 2021
             baseline and floored at zero.
+        trend_dampening: When true, trend adjustments are tapered and then
+            frozen instead of extrapolating linearly forever.
 
     Returns:
         A :class:`SimulationResult` containing the annual survival projection,
@@ -372,7 +424,15 @@ def simulate_survival(
     for age in range(initial_age, tail_start_age):
         calendar_year = start_year + (age - initial_age)
         total_rate = sum(
-            _resolve_rate(age, calendar_year, code, rate_table, scenario_map, trend_table)
+            _resolve_rate(
+                age,
+                calendar_year,
+                code,
+                rate_table,
+                scenario_map,
+                trend_table,
+                trend_dampening,
+            )
             for code in cause_codes
         )
         hazard = total_rate / RATE_SCALE
@@ -395,7 +455,15 @@ def simulate_survival(
 
     tail_calendar_year = start_year + (tail_start_age - initial_age)
     tail_total_rate = sum(
-        _resolve_rate(tail_start_age, tail_calendar_year, code, rate_table, scenario_map, trend_table)
+        _resolve_rate(
+            tail_start_age,
+            tail_calendar_year,
+            code,
+            rate_table,
+            scenario_map,
+            trend_table,
+            trend_dampening,
+        )
         for code in cause_codes
     )
     tail_hazard = tail_total_rate / RATE_SCALE

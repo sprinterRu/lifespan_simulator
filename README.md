@@ -6,6 +6,7 @@ Interactive Streamlit app for exploring male mortality in Spain using the `morta
 
 - Simulates a synthetic cohort starting at a chosen age in 2021.
 - Lets you override selected cause-specific death rates from a future calendar year onward.
+- Lets you dampen historical trend extrapolation so fitted slopes taper and then freeze.
 - Shows projected cause-specific mortality paths, total mortality, and a survival curve with death-age percentiles.
 - Explores 2011-2021 mortality-rate trends for selected causes and age groups with linear trend lines and 95% confidence intervals.
 
@@ -13,6 +14,7 @@ Interactive Streamlit app for exploring male mortality in Spain using the `morta
 
 - The simulator uses the 2021 mortality schedule only.
 - Mortality rates are interpreted as constant annual hazards within each age bucket.
+- With trend dampening enabled, fitted slopes apply fully for 15 years, taper over 15 years, then freeze.
 - The `95 years or over` bucket remains flat after age 94.
 - The source file contains overlapping roll-up categories and subcategories. To avoid double-counting in the simulator totals, the app excludes the overlapping roll-ups and keeps a non-overlapping cause set for survival calculations.
 - The historical explorer keeps the full dataset because it visualizes individual series rather than summing them.
