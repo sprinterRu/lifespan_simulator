@@ -3,19 +3,18 @@
 The functions in this module receive the normalized 2021 simulator dataset
 prepared in :mod:`lifespan_simulator.data` and optional intervention settings
 collected by the Streamlit UI. They convert cause-specific mortality rates into
-annual hazards, apply any selected future replacement rates, and return the
-tables needed by the app's charts and metrics.
+annual hazards by interpolating source age-bucket rates to attained ages, apply
+any selected two-stage exponential interventions, and return the tables needed
+by the app's charts and metrics.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, inf, log
-from typing import Any
+from math import ceil, exp, inf, log
+from typing import Any, NamedTuple
 
 import pandas as pd
-
-from .data import get_age_bucket_start
 
 START_YEAR = 2021
 # Mortality rates in the source data are expressed per 100,000 population.
@@ -39,6 +38,31 @@ PERCENTILES = {
 TrendTable = dict[int, dict[str, float]]
 
 
+class InterventionConfig(NamedTuple):
+    """Five-number intervention tuple used by scenario projections."""
+
+    slow_start_year: int
+    slow_rate: float
+    fast_start_year: int
+    fast_rate: float
+    floor: float
+
+
+ScenarioMap = dict[str, InterventionConfig]
+
+
+class AgeRatePoint(NamedTuple):
+    """One source age-bucket point used for annual age interpolation."""
+
+    age_mid: float
+    age_start: int
+    age_end: int | None
+    rate: float
+
+
+RateTable = dict[str, tuple[AgeRatePoint, ...]]
+
+
 @dataclass(frozen=True)
 class SimulationResult:
     """Full result for one synthetic cohort simulation.
@@ -59,9 +83,9 @@ class SimulationResult:
             columns and extends into the terminal tail far enough to show the
             modeled percentile ages.
         tail_start_age: First attained age handled by the terminal tail. It is
-            computed by :func:`simulate_survival` from age 95 and any later
-            intervention effective years, because the source data's final age
-            bucket is ``95+``.
+            computed by :func:`simulate_survival` from age 95, any explicit
+            trend horizon, and any later year when active interventions reach
+            their mortality floor.
         tail_hazard: Constant annual hazard assumed from ``tail_start_age``
             onward. It comes from the total resolved mortality rate at the tail
             boundary divided by :data:`RATE_SCALE`.
@@ -89,7 +113,7 @@ class SimulationResult:
     percentiles: dict[str, float | None]
 
 
-def _build_rate_table(frame: pd.DataFrame) -> tuple[dict[int, dict[str, float]], dict[str, str]]:
+def _build_rate_table(frame: pd.DataFrame) -> tuple[RateTable, dict[str, str]]:
     """Convert the simulator mortality frame into fast lookup dictionaries.
 
     Args:
@@ -101,52 +125,216 @@ def _build_rate_table(frame: pd.DataFrame) -> tuple[dict[int, dict[str, float]],
             ``cause_name``, and ``rate`` columns.
 
     Returns:
-        A pair of dictionaries. The first maps an age-bucket start, such as
-        ``35`` or ``95``, to a nested mapping from ICD-10 cause code to the
-        source mortality rate for that bucket. The second maps each cause code
-        to the human-readable cause name used in tables and charts.
+        A pair of dictionaries. The first maps each cause code to sorted
+        age-midpoint rate observations used for annual interpolation. The
+        second maps each cause code to the human-readable cause name used in
+        tables and charts.
     """
-    rate_table = (
-        frame.pivot_table(index="age_start", columns="cause_code", values="rate", aggfunc="first")
-        .fillna(0.0)
-        .to_dict(orient="index")
-    )
+    rate_table = {
+        str(cause_code): tuple(
+            AgeRatePoint(
+                age_mid=float(row.age_mid),
+                age_start=int(row.age_start),
+                age_end=None if pd.isna(row.age_end) else int(row.age_end),
+                rate=float(row.rate),
+            )
+            for row in group.sort_values("age_mid").itertuples(index=False)
+        )
+        for cause_code, group in frame.groupby("cause_code", sort=False)
+    }
     cause_names = frame.drop_duplicates("cause_code").set_index("cause_code")["cause_name"].to_dict()
     return rate_table, cause_names
 
 
-def build_scenario_map(raw_scenarios: dict[str, dict[str, Any]]) -> dict[str, dict[str, float | int]]:
+def build_scenario_map(raw_scenarios: dict[str, dict[str, Any] | tuple[Any, ...]]) -> ScenarioMap:
     """Normalize raw intervention inputs into the simulation scenario format.
 
     Args:
         raw_scenarios: Mapping keyed by cause code. In the app it is assembled
             in ``render_simulator_tab`` from the selected intervention causes
-            and the Streamlit number inputs named ``year_<cause_code>`` and
-            ``rate_<cause_code>``. Each value must provide ``effective_year``,
-            the first calendar year when the intervention applies, and ``rate``,
-            the replacement mortality rate per 100,000 population.
+            and the Streamlit number inputs for the five intervention values:
+            slow-stage start year, slow annual fractional reduction, fast-stage
+            start year, fast annual fractional reduction, and irreducible floor
+            multiplier. Each value may be a mapping with named fields or a
+            five-item tuple in that order.
 
     Returns:
-        A clean scenario map keyed by cause code. ``effective_year`` is coerced
-        to ``int`` and ``rate`` is coerced to ``float`` and clamped to zero or
-        above so downstream projection code can use the values without knowing
-        about Streamlit widget types.
+        A clean scenario map keyed by cause code. Values are
+        :class:`InterventionConfig` tuples. Rates are clamped to the
+        ``[0, 1]`` interval, the floor is clamped to ``(0, 1]``, and the fast
+        start year is not allowed to precede the slow start year.
     """
-    scenario_map: dict[str, dict[str, float | int]] = {}
+    scenario_map: ScenarioMap = {}
     for cause_code, config in raw_scenarios.items():
-        scenario_map[cause_code] = {
-            "effective_year": int(config["effective_year"]),
-            "rate": max(0.0, float(config["rate"])),
-        }
+        if isinstance(config, tuple):
+            slow_start_year, slow_rate, fast_start_year, fast_rate, floor = config
+        else:
+            slow_start_year = config["slow_start_year"]
+            slow_rate = config["slow_rate"]
+            fast_start_year = config["fast_start_year"]
+            fast_rate = config["fast_rate"]
+            floor = config["floor"]
+
+        normalized_slow_start = int(slow_start_year)
+        normalized_fast_start = max(normalized_slow_start, int(fast_start_year))
+        scenario_map[cause_code] = InterventionConfig(
+            slow_start_year=normalized_slow_start,
+            slow_rate=_clamp_unit_interval(float(slow_rate)),
+            fast_start_year=normalized_fast_start,
+            fast_rate=_clamp_unit_interval(float(fast_rate)),
+            floor=min(1.0, max(1e-12, float(floor))),
+        )
     return scenario_map
+
+
+def _clamp_unit_interval(value: float) -> float:
+    """Clamp a fractional reduction rate to the closed unit interval."""
+    return min(1.0, max(0.0, value))
+
+
+def _counterfactual_rate(
+    age: int,
+    calendar_year: int,
+    cause_code: str,
+    rate_table: RateTable,
+    trend_table: TrendTable | None = None,
+    trend_dampening: bool = False,
+) -> float:
+    """Resolve the no-intervention rate before applying a scenario multiplier."""
+    baseline_rate = _interpolate_rate(age, rate_table.get(cause_code, ()))
+    if trend_table is not None:
+        slope = _interpolate_trend_slope(age, cause_code, rate_table.get(cause_code, ()), trend_table)
+        years_since_start = calendar_year - START_YEAR
+        trend_years = (
+            dampened_trend_years(years_since_start)
+            if trend_dampening
+            else float(years_since_start)
+        )
+        return max(0.0, baseline_rate + slope * trend_years)
+    return baseline_rate
+
+
+def _interpolate_rate(age: int | float, points: tuple[AgeRatePoint, ...]) -> float:
+    """Linearly interpolate a source age-bucket rate to an annual age."""
+    return _interpolate_age_value(
+        age,
+        [(point.age_mid, point.rate) for point in points],
+        terminal_start_age=_terminal_bucket_start(points),
+    )
+
+
+def _interpolate_trend_slope(
+    age: int | float,
+    cause_code: str,
+    points: tuple[AgeRatePoint, ...],
+    trend_table: TrendTable,
+) -> float:
+    """Linearly interpolate age-bucket trend slopes to an annual age."""
+    return _interpolate_age_value(
+        age,
+        [
+            (point.age_mid, float(trend_table.get(point.age_start, {}).get(cause_code, 0.0)))
+            for point in points
+        ],
+        terminal_start_age=_terminal_bucket_start(points),
+    )
+
+
+def _terminal_bucket_start(points: tuple[AgeRatePoint, ...]) -> int | None:
+    """Return the source start age for an open-ended terminal bucket."""
+    if points and points[-1].age_end is None:
+        return points[-1].age_start
+    return None
+
+
+def _interpolate_age_value(
+    age: int | float,
+    points: list[tuple[float, float]],
+    terminal_start_age: int | None = None,
+) -> float:
+    """Interpolate over age, while holding an open-ended terminal bucket flat."""
+    if not points:
+        return 0.0
+
+    numeric_age = float(age)
+    if terminal_start_age is not None and numeric_age >= terminal_start_age:
+        return points[-1][1]
+    if numeric_age <= points[0][0]:
+        return points[0][1]
+    if numeric_age >= points[-1][0]:
+        return points[-1][1]
+
+    for (lower_age, lower_value), (upper_age, upper_value) in zip(points, points[1:]):
+        if lower_age <= numeric_age <= upper_age:
+            position = (numeric_age - lower_age) / (upper_age - lower_age)
+            return lower_value + (upper_value - lower_value) * position
+
+    return points[-1][1]
+
+
+def _intervention_multiplier(calendar_year: int, scenario: InterventionConfig) -> float:
+    """Return the two-stage exponential multiplier for one calendar year."""
+    if calendar_year < scenario.slow_start_year:
+        return 1.0
+
+    if calendar_year < scenario.fast_start_year:
+        slow_years = calendar_year - scenario.slow_start_year + 1
+        multiplier = (1.0 - scenario.slow_rate) ** slow_years
+    else:
+        slow_years = max(0, scenario.fast_start_year - scenario.slow_start_year)
+        fast_years = calendar_year - scenario.fast_start_year + 1
+        multiplier = ((1.0 - scenario.slow_rate) ** slow_years) * (
+            (1.0 - scenario.fast_rate) ** fast_years
+        )
+
+    return max(scenario.floor, multiplier)
+
+
+def _intervention_stabilization_year(scenario: InterventionConfig) -> int:
+    """Find the first year when an intervention multiplier stops changing."""
+    if scenario.floor >= 1.0 or (scenario.slow_rate <= 0.0 and scenario.fast_rate <= 0.0):
+        return START_YEAR
+
+    slow_stage_years = max(0, scenario.fast_start_year - scenario.slow_start_year)
+    if slow_stage_years > 0:
+        years_to_floor = _years_to_reach_floor(1.0, scenario.slow_rate, scenario.floor)
+        if years_to_floor is not None and years_to_floor <= slow_stage_years:
+            return scenario.slow_start_year + years_to_floor - 1
+        multiplier_at_fast_start = (1.0 - scenario.slow_rate) ** slow_stage_years
+    else:
+        multiplier_at_fast_start = 1.0
+
+    years_to_floor = _years_to_reach_floor(
+        multiplier_at_fast_start,
+        scenario.fast_rate,
+        scenario.floor,
+    )
+    if years_to_floor is None:
+        return scenario.fast_start_year
+    return scenario.fast_start_year + years_to_floor - 1
+
+
+def _years_to_reach_floor(
+    current_multiplier: float,
+    annual_reduction: float,
+    floor: float,
+) -> int | None:
+    """Return the number of annual reductions needed to reach ``floor``."""
+    if current_multiplier <= floor:
+        return 0
+    if annual_reduction <= 0.0:
+        return None
+    if annual_reduction >= 1.0:
+        return 1
+    return max(1, int(ceil(log(floor / current_multiplier) / log(1.0 - annual_reduction))))
 
 
 def _resolve_rate(
     age: int,
     calendar_year: int,
     cause_code: str,
-    rate_table: dict[int, dict[str, float]],
-    scenario_map: dict[str, dict[str, float | int]],
+    rate_table: RateTable,
+    scenario_map: ScenarioMap,
     trend_table: TrendTable | None = None,
     trend_dampening: bool = False,
 ) -> float:
@@ -161,13 +349,12 @@ def _resolve_rate(
             simulator dataset, from selected chart causes, or from the keys of
             a scenario map.
         rate_table: Baseline rate lookup returned by :func:`_build_rate_table`.
-            It provides source 2021 mortality rates by age-bucket start and
-            cause code.
+            It provides source 2021 mortality rates by cause code, with
+            age-bucket midpoint observations used for annual interpolation.
         scenario_map: Normalized intervention map returned by
-            :func:`build_scenario_map`. If it contains ``cause_code`` and
-            ``calendar_year`` is greater than or equal to that intervention's
-            ``effective_year``, the scenario replacement rate is used before
-            any historical trend adjustment.
+            :func:`build_scenario_map`. If it contains ``cause_code``, the
+            cause's no-intervention rate is multiplied by the selected
+            two-stage exponential intervention path.
         trend_table: Optional nested lookup returned by
             ``lifespan_simulator.trends.build_trend_model``. When present, it
             supplies significant linear annual slopes by age bucket and cause
@@ -177,26 +364,22 @@ def _resolve_rate(
             :data:`TREND_TAPER_YEARS`, and then held fixed.
 
     Returns:
-        The applicable mortality rate per 100,000 population. Interventions
-        override all other behavior. Otherwise, if a trend table is supplied,
-        the 2021 baseline rate is adjusted by the fitted slope and floored at
-        zero. Without a trend table, the fixed 2021 baseline rate is returned.
+        The applicable mortality rate per 100,000 population. Historical trend
+        adjustment is resolved first; active interventions then reduce that
+        counterfactual rate by a floor-limited exponential multiplier.
     """
-    bucket_start = get_age_bucket_start(age)
-    baseline_rate = float(rate_table[bucket_start].get(cause_code, 0.0))
+    counterfactual_rate = _counterfactual_rate(
+        age,
+        calendar_year,
+        cause_code,
+        rate_table,
+        trend_table,
+        trend_dampening,
+    )
     scenario = scenario_map.get(cause_code)
-    if scenario and calendar_year >= int(scenario["effective_year"]):
-        return float(scenario["rate"])
-    if trend_table is not None:
-        slope = float(trend_table.get(bucket_start, {}).get(cause_code, 0.0))
-        years_since_start = calendar_year - START_YEAR
-        trend_years = (
-            dampened_trend_years(years_since_start)
-            if trend_dampening
-            else float(years_since_start)
-        )
-        return max(0.0, baseline_rate + slope * trend_years)
-    return baseline_rate
+    if scenario is None:
+        return counterfactual_rate
+    return counterfactual_rate * _intervention_multiplier(calendar_year, scenario)
 
 
 def dampened_trend_years(
@@ -228,7 +411,7 @@ def project_cause_rates(
     frame: pd.DataFrame,
     initial_age: int,
     selected_causes: list[str],
-    scenario_map: dict[str, dict[str, float | int]],
+    scenario_map: ScenarioMap,
     max_age: int,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
@@ -306,7 +489,7 @@ def project_cause_rates(
 def project_total_rates(
     frame: pd.DataFrame,
     initial_age: int,
-    scenario_map: dict[str, dict[str, float | int]],
+    scenario_map: ScenarioMap,
     max_age: int,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
@@ -322,8 +505,9 @@ def project_total_rates(
         initial_age: Cohort starting age selected by the Streamlit
             ``Initial age`` slider.
         scenario_map: Normalized intervention map returned by
-            :func:`build_scenario_map`. Each matching cause can replace the
-            baseline rate from its effective year onward.
+            :func:`build_scenario_map`. Each matching cause applies a
+            floor-limited two-stage exponential multiplier to the otherwise
+            projected cause-specific rate.
         max_age: Last attained age to project. The app typically passes the
             display horizon returned by ``get_display_horizon(initial_age)``.
         start_year: Calendar year assigned to ``initial_age``. It defaults to
@@ -372,7 +556,7 @@ def project_total_rates(
 def simulate_survival(
     frame: pd.DataFrame,
     initial_age: int,
-    scenario_map: dict[str, dict[str, float | int]] | None = None,
+    scenario_map: ScenarioMap | None = None,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
     trend_dampening: bool = False,
@@ -387,9 +571,9 @@ def simulate_survival(
             slider. Survival is initialized to 1.0 at this attained age.
         scenario_map: Optional normalized intervention map returned by
             :func:`build_scenario_map`. When omitted or empty, every cause uses
-            the baseline 2021 rate for the matching age bucket. When provided,
-            a cause's rate switches to its scenario replacement rate once the
-            projected calendar year reaches ``effective_year``.
+            the no-intervention rate for the matching age bucket. When
+            provided, selected causes follow the scenario's slow-stage and
+            fast-stage exponential mortality reductions down to their floor.
         start_year: Calendar year assigned to ``initial_age``. The default is
             :data:`START_YEAR`, which matches the source year used for baseline
             rates in the simulator frame.
@@ -410,8 +594,10 @@ def simulate_survival(
     rate_table, cause_names = _build_rate_table(frame)
     cause_codes = sorted(cause_names)
 
-    last_change_year = max([start_year] + [int(config["effective_year"]) for config in scenario_map.values()])
-    latest_intervention_age = initial_age + max(0, last_change_year - start_year)
+    last_stable_year = max(
+        [start_year] + [_intervention_stabilization_year(config) for config in scenario_map.values()]
+    )
+    latest_intervention_age = initial_age + max(0, last_stable_year - start_year)
     if trend_table is None:
         tail_start_age = max(95, latest_intervention_age)
     else:
@@ -504,7 +690,8 @@ def _compute_percentiles(
             ``hazard``, ``survival_start``, and ``survival_end``.
         tail_start_age: First age handled by the open-ended terminal tail. It
             is computed in :func:`simulate_survival` from the source data's
-            ``95+`` bucket and any later intervention effective years.
+            ``95+`` bucket, any explicit trend horizon, and any later year
+            when active intervention multipliers stop changing.
         tail_hazard: Constant annual hazard used after ``tail_start_age``. It
             is computed in :func:`simulate_survival` by resolving all cause
             rates at the tail boundary and dividing their total by

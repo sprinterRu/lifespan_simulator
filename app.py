@@ -24,6 +24,7 @@ from lifespan_simulator.data import (
     load_mortality_data,
 )
 from lifespan_simulator.simulation import (
+    ScenarioMap,
     TREND_FULL_YEARS,
     TREND_TAPER_YEARS,
     build_scenario_map,
@@ -40,7 +41,19 @@ st.set_page_config(page_title="Lifespan Simulator", layout="wide")
 
 EXPLORER_CAUSE_SELECTION_KEY = "explorer_selected_causes"
 INTERVENTION_CAUSES_KEY = "simulator_intervention_causes"
-ACTIVE_INTERVENTION_COLUMNS = ("Cause", "Effective year", "New rate")
+SLOW_START_YEAR_DEFAULT = 2040
+SLOW_RATE_DEFAULT = 0.015
+FAST_START_YEAR_DEFAULT = 2080
+FAST_RATE_DEFAULT = 0.10
+FLOOR_DEFAULT = 0.01
+ACTIVE_INTERVENTION_COLUMNS = (
+    "Cause",
+    "Slow start year",
+    "Slow annual reduction",
+    "Fast start year",
+    "Fast annual reduction",
+    "Floor",
+)
 
 
 @st.cache_data(show_spinner=False)
@@ -151,7 +164,7 @@ def cause_names_by_code(frame: pd.DataFrame) -> dict[str, str]:
 
 
 def active_interventions_frame(
-    scenario_map: dict[str, dict[str, float | int]],
+    scenario_map: ScenarioMap,
     cause_name_lookup: dict[str, str],
 ) -> pd.DataFrame:
     """Convert active scenario settings into the CSV-compatible table shape.
@@ -159,8 +172,8 @@ def active_interventions_frame(
     Args:
         scenario_map: Normalized intervention map returned by
             ``build_scenario_map``. It is keyed by ICD-10 cause code and stores
-            ``effective_year`` plus replacement ``rate`` values from the
-            simulator controls or a loaded CSV.
+            five-number intervention tuples from the simulator controls or a
+            loaded CSV.
         cause_name_lookup: Code-to-name dictionary returned by
             :func:`cause_names_by_code`. It comes from the same
             ``simulator_frame`` as the scenario controls, ensuring table labels
@@ -168,15 +181,18 @@ def active_interventions_frame(
 
     Returns:
         DataFrame with exactly the columns in
-        :data:`ACTIVE_INTERVENTION_COLUMNS`: ``Cause``, ``Effective year``, and
-        ``New rate``. This is the same shape expected when loading a saved CSV.
+        :data:`ACTIVE_INTERVENTION_COLUMNS`. This is the same shape expected
+        when loading a saved CSV.
     """
     return pd.DataFrame(
         [
             {
                 "Cause": cause_name_lookup[cause_code],
-                "Effective year": config["effective_year"],
-                "New rate": config["rate"],
+                "Slow start year": config.slow_start_year,
+                "Slow annual reduction": config.slow_rate,
+                "Fast start year": config.fast_start_year,
+                "Fast annual reduction": config.fast_rate,
+                "Floor": config.floor,
             }
             for cause_code, config in scenario_map.items()
         ],
@@ -203,15 +219,14 @@ def parse_interventions_csv(
         A pair of values. The first is the ordered list of cause display names
         from the CSV; it is used to seed the Streamlit multiselect. The second
         is a raw scenario-input mapping keyed by cause code with
-        ``effective_year`` and ``rate`` values; it has the same shape as the
-        dictionary built from manual Streamlit inputs before calling
-        ``build_scenario_map``.
+        the five intervention values; it has the same shape as the dictionary
+        built from manual Streamlit inputs before calling ``build_scenario_map``.
 
     Raises:
         ValueError: If required columns are missing, the file contains no
-            intervention rows, a cause is unknown or duplicated, the effective
-            year is not an integer in the supported 2021-2120 range, or the
-            replacement rate is negative or not numeric.
+            intervention rows, a cause is unknown or duplicated, years are not
+            whole numbers in the supported 2021-2120 range, the fast start
+            year precedes the slow start year, or rates/floors are invalid.
         pandas.errors.EmptyDataError: If pandas cannot find any CSV columns.
         pandas.errors.ParserError: If pandas cannot parse the uploaded CSV.
     """
@@ -238,24 +253,58 @@ def parse_interventions_csv(
         if cause_name in cause_names:
             raise ValueError(f"Duplicate cause on row {row_number}: {cause_name}.")
 
-        effective_year = pd.to_numeric(row["Effective year"], errors="coerce")
-        if pd.isna(effective_year) or int(effective_year) != effective_year:
-            raise ValueError(f"Effective year must be a whole number on row {row_number}.")
-        effective_year = int(effective_year)
-        if not 2021 <= effective_year <= 2120:
-            raise ValueError(f"Effective year must be between 2021 and 2120 on row {row_number}.")
+        slow_start_year = parse_csv_year(row, "Slow start year", row_number)
+        fast_start_year = parse_csv_year(row, "Fast start year", row_number)
+        if fast_start_year < slow_start_year:
+            raise ValueError(f"Fast start year must be no earlier than slow start year on row {row_number}.")
 
-        new_rate = pd.to_numeric(row["New rate"], errors="coerce")
-        if pd.isna(new_rate) or float(new_rate) < 0:
-            raise ValueError(f"New rate must be a non-negative number on row {row_number}.")
+        slow_rate = parse_csv_fraction(row, "Slow annual reduction", row_number)
+        fast_rate = parse_csv_fraction(row, "Fast annual reduction", row_number)
+        floor = parse_csv_fraction(row, "Floor", row_number, allow_zero=False)
 
         cause_names.append(cause_name)
         loaded_inputs[all_cause_options[cause_name]] = {
-            "effective_year": effective_year,
-            "rate": float(new_rate),
+            "slow_start_year": slow_start_year,
+            "slow_rate": slow_rate,
+            "fast_start_year": fast_start_year,
+            "fast_rate": fast_rate,
+            "floor": floor,
         }
 
     return cause_names, loaded_inputs
+
+
+def parse_csv_year(row: dict[str, object], column: str, row_number: int) -> int:
+    """Parse and validate one intervention year from an uploaded CSV row."""
+    value = pd.to_numeric(row[column], errors="coerce")
+    if pd.isna(value) or int(value) != value:
+        raise ValueError(f"{column} must be a whole number on row {row_number}.")
+    parsed = int(value)
+    if not 2021 <= parsed <= 2120:
+        raise ValueError(f"{column} must be between 2021 and 2120 on row {row_number}.")
+    return parsed
+
+
+def parse_csv_fraction(
+    row: dict[str, object],
+    column: str,
+    row_number: int,
+    allow_zero: bool = True,
+) -> float:
+    """Parse a fractional rate or floor from an uploaded CSV row."""
+    value = pd.to_numeric(row[column], errors="coerce")
+    range_text = "between 0 and 1" if allow_zero else "greater than 0 and no more than 1"
+    if pd.isna(value):
+        raise ValueError(f"{column} must be a number {range_text} on row {row_number}.")
+
+    parsed = float(value)
+    lower_bound_valid = parsed >= 0 if allow_zero else parsed > 0
+    if not lower_bound_valid or parsed > 1:
+        raise ValueError(
+            f"{column} must be a fraction {range_text} on row {row_number} "
+            "(for example, 0.015 for 1.5%)."
+        )
+    return parsed
 
 
 def apply_loaded_interventions(
@@ -271,8 +320,8 @@ def apply_loaded_interventions(
             for the ``Causes to modify in the scenario`` multiselect.
         scenario_inputs: Raw scenario-input mapping returned by
             :func:`parse_interventions_csv`. It is keyed by cause code and
-            contains ``effective_year`` plus ``rate`` values to copy into the
-            per-cause number-input widgets.
+            contains the five intervention values to copy into the per-cause
+            number-input widgets.
         all_cause_options: Display-name-to-code dictionary returned by
             :func:`cause_options`. It is used to translate each display name in
             ``cause_names`` into the cause code embedded in the widget keys.
@@ -281,25 +330,11 @@ def apply_loaded_interventions(
     for cause_name in cause_names:
         cause_code = all_cause_options[cause_name]
         config = scenario_inputs[cause_code]
-        st.session_state[f"year_{cause_code}"] = int(config["effective_year"])
-        st.session_state[f"rate_{cause_code}"] = float(config["rate"])
-
-
-def minimum_rates_by_code(frame: pd.DataFrame) -> dict[str, float]:
-    """Find the lowest baseline rate available for each simulator cause.
-
-    Args:
-        frame: Mortality DataFrame currently being used by the simulator tab.
-            In normal app execution this is ``simulator_frame`` from
-            :func:`load_frames`, filtered to the 2021 non-overlapping cause set.
-
-    Returns:
-        Dictionary keyed by ICD-10 cause code. Each value is the minimum
-        mortality rate per 100,000 observed for that cause across the simulator
-        age buckets. The simulator uses this as the default replacement rate
-        when a user first selects an intervention cause.
-    """
-    return frame.groupby("cause_code")["rate"].min().astype(float).to_dict()
+        st.session_state[f"slow_start_year_{cause_code}"] = int(config["slow_start_year"])
+        st.session_state[f"slow_rate_{cause_code}"] = float(config["slow_rate"])
+        st.session_state[f"fast_start_year_{cause_code}"] = int(config["fast_start_year"])
+        st.session_state[f"fast_rate_{cause_code}"] = float(config["fast_rate"])
+        st.session_state[f"floor_{cause_code}"] = float(config["floor"])
 
 
 def default_explorer_causes(raw_frame: pd.DataFrame, age_label: str) -> list[str]:
@@ -475,7 +510,7 @@ def scenario_top_causes(
     simulator_frame: pd.DataFrame,
     initial_age: int,
     age_band_start: int,
-    scenario_map: dict[str, dict[str, float | int]],
+    scenario_map: ScenarioMap,
     trend_table: dict[int, dict[str, float]] | None = None,
     trend_dampening: bool = False,
     limit: int = 5,
@@ -542,17 +577,20 @@ def render_intro(simulator_frame: pd.DataFrame) -> None:
     st.title("Lifespan Simulator")
     st.caption(
         "Male mortality in Spain, 2011-2021. The simulator can apply statistically significant historical trends "
-        "to future cause-specific rates, and lets you override selected causes in future calendar years."
+        "to future cause-specific rates, and lets you apply two-stage interventions to selected causes."
     )
     with st.expander("Model assumptions used by the app", expanded=False):
         st.markdown(
             f"""
             - The simulator starts from the 2021 age-specific mortality schedule.
+            - Source five-year age-bucket rates are linearly interpolated across age-bucket midpoints to produce annual attained-age rates; the open-ended `95 years or over` bucket is held flat from age 95 onward.
             - The simulator tab has a default-on control for applying statistically significant 2011-2021 cause-age trends to future rates.
             - Trend-adjusted rates use linear changes per 100,000 population and are floored at zero.
             - Trend dampening applies fitted slopes fully for {TREND_FULL_YEARS} years, tapers them over {TREND_TAPER_YEARS} years, then freezes the cumulative trend adjustment.
-            - Mortality is treated as a constant annual hazard within each age bucket.
-            - The source `95 years or over` bucket is reused for attained ages 95+; with trends enabled, rates are projected annually through the explicit trend horizon before the tail hazard is frozen.
+            - Active interventions multiply the no-intervention cause-specific rate by a two-stage exponential decline: a slow annual reduction, then a fast annual reduction, both bounded by an irreducible floor multiplier.
+            - The two-stage intervention shape is inspired by historical tuberculosis mortality declines, such as the England and Wales series from [Our World in Data](https://ourworldindata.org/grapher/death-rate-tuberculosis-england-wales).
+            - Mortality is treated as a constant annual hazard within each modeled one-year age interval.
+            - With trends enabled or active interventions still changing, rates are projected annually through the explicit horizon before the tail hazard is frozen.
             - The simulator works with {simulator_frame['cause_code'].nunique()} mutually exclusive cause series after excluding {len(SIMULATOR_EXCLUDED_CAUSES)} roll-up series that would otherwise double-count deaths.
             - The historical explorer keeps the full dataset, including aggregate categories, because it does not sum them.
             """
@@ -575,7 +613,6 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
     """
     all_cause_options = cause_options(simulator_frame)
     cause_name_lookup = cause_names_by_code(simulator_frame)
-    cause_minimum_rates = minimum_rates_by_code(simulator_frame)
     age_min = int(simulator_frame["age_start"].min())
     age_max = int(simulator_frame["age_start"].max())
 
@@ -587,7 +624,7 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
             value=True,
             help=(
                 "When enabled, future rates use significant 2011-2021 linear cause-age trends "
-                "unless an active intervention overrides that cause."
+                "before any active intervention multiplier is applied."
             ),
         )
         trend_dampening = st.toggle(
@@ -611,7 +648,7 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
                 f"{dampening_note} Rates are floored at 0."
             )
         else:
-            st.caption("Using fixed 2021 cause-age rates unless an intervention overrides them.")
+            st.caption("Using fixed 2021 cause-age rates before any active intervention multiplier is applied.")
     active_trend_table = trend_model.slope_table if use_trends else None
     active_trend_dampening = bool(use_trends and trend_dampening)
     top_cause_age_bands = available_top_cause_age_bands(simulator_frame, initial_age)
@@ -648,8 +685,8 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
             "Causes to modify in the scenario",
             options=sorted(all_cause_options.keys()),
             help=(
-                "Set a future calendar year and replacement rate for each selected cause. "
-                "The replacement rate defaults to the cause's lowest 2021 rate across age groups."
+                "Set slow and fast exponential mortality-reduction stages for each selected cause. "
+                "Rates and floors are fractions: 0.015 means 1.5% per year, and 0.01 means a 1% floor."
             ),
             key=INTERVENTION_CAUSES_KEY,
         )
@@ -657,32 +694,89 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
     scenario_inputs: dict[str, dict[str, float | int]] = {}
     if intervention_causes:
         st.markdown("### Scenario controls")
+        header_cols = st.columns([1.7, 0.95, 1.0, 0.95, 1.0, 0.8])
+        for column, label in zip(
+            header_cols,
+            [
+                "Cause",
+                "Slow start",
+                "Slow reduction",
+                "Fast start",
+                "Fast reduction",
+                "Floor",
+            ],
+        ):
+            column.caption(label)
         for cause_name in intervention_causes:
             cause_code = all_cause_options[cause_name]
-            label_col, year_col, rate_col = st.columns([1.6, 1, 1])
+            label_col, slow_year_col, slow_rate_col, fast_year_col, fast_rate_col, floor_col = st.columns(
+                [1.7, 0.95, 1.0, 0.95, 1.0, 0.8]
+            )
             with label_col:
                 st.markdown(f"**{cause_name}**")
-            with year_col:
-                effective_year = st.number_input(
-                    f"Effective year for {cause_name}",
+            with slow_year_col:
+                slow_start_year = st.number_input(
+                    f"Slow start year for {cause_name}",
                     min_value=2021,
                     max_value=2120,
-                    value=2030,
+                    value=SLOW_START_YEAR_DEFAULT,
                     step=1,
-                    key=f"year_{cause_code}",
+                    key=f"slow_start_year_{cause_code}",
                     label_visibility="collapsed",
                 )
-            with rate_col:
-                replacement_rate = st.number_input(
-                    f"Rate after intervention for {cause_name}",
+            with slow_rate_col:
+                slow_rate = st.number_input(
+                    f"Slow annual reduction for {cause_name}",
                     min_value=0.0,
-                    value=cause_minimum_rates[cause_code],
-                    step=0.01,
-                    format="%.2f",
-                    key=f"rate_{cause_code}",
+                    max_value=1.0,
+                    value=SLOW_RATE_DEFAULT,
+                    step=0.005,
+                    format="%.3f",
+                    key=f"slow_rate_{cause_code}",
                     label_visibility="collapsed",
                 )
-            scenario_inputs[cause_code] = {"effective_year": effective_year, "rate": replacement_rate}
+            fast_year_key = f"fast_start_year_{cause_code}"
+            if st.session_state.get(fast_year_key, FAST_START_YEAR_DEFAULT) < slow_start_year:
+                st.session_state[fast_year_key] = int(slow_start_year)
+            with fast_year_col:
+                fast_start_year = st.number_input(
+                    f"Fast start year for {cause_name}",
+                    min_value=int(slow_start_year),
+                    max_value=2120,
+                    value=max(FAST_START_YEAR_DEFAULT, int(slow_start_year)),
+                    step=1,
+                    key=fast_year_key,
+                    label_visibility="collapsed",
+                )
+            with fast_rate_col:
+                fast_rate = st.number_input(
+                    f"Fast annual reduction for {cause_name}",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=FAST_RATE_DEFAULT,
+                    step=0.01,
+                    format="%.3f",
+                    key=f"fast_rate_{cause_code}",
+                    label_visibility="collapsed",
+                )
+            with floor_col:
+                floor = st.number_input(
+                    f"Irreducible floor for {cause_name}",
+                    min_value=0.0001,
+                    max_value=1.0,
+                    value=FLOOR_DEFAULT,
+                    step=0.001,
+                    format="%.4f",
+                    key=f"floor_{cause_code}",
+                    label_visibility="collapsed",
+                )
+            scenario_inputs[cause_code] = {
+                "slow_start_year": slow_start_year,
+                "slow_rate": slow_rate,
+                "fast_start_year": fast_start_year,
+                "fast_rate": fast_rate,
+                "floor": floor,
+            }
 
     scenario_map = build_scenario_map(scenario_inputs)
     baseline_result = simulate_survival(
