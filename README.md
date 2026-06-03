@@ -6,7 +6,7 @@ Interactive Streamlit app for exploring male mortality in Spain using the `morta
 
 - Simulates a synthetic cohort starting at a chosen age in 2021.
 - Lets you apply selected cause-specific interventions with a slow exponential mortality decline followed by a faster exponential decline.
-- Lets you dampen historical trend extrapolation so fitted slopes taper and then freeze.
+- Lets you bound historical trend extrapolation with a residual floor for declining trends and a ceiling for growing trends.
 - Shows projected cause-specific mortality paths, total mortality, and a survival curve with death-age percentiles.
 - Explores 2011-2021 mortality-rate trends for selected causes and age groups with linear trend lines and 95% confidence intervals.
 
@@ -15,7 +15,7 @@ Interactive Streamlit app for exploring male mortality in Spain using the `morta
 - The simulator uses the 2021 mortality schedule only.
 - Source five-year age-bucket rates are linearly interpolated across age-bucket midpoints to produce annual attained-age rates; the open-ended `95 years or over` bucket is held flat from age 95 onward.
 - Mortality rates are interpreted as constant annual hazards within each modeled one-year age interval.
-- With trend dampening enabled, fitted slopes apply fully for 15 years, taper over 15 years, then freeze.
+- Significant historical trend slopes remain linear, but projected rates are bounded relative to the 2021 cause-age rate. By default, declining trends cannot fall below 15% of the 2021 rate, and growing trends cannot rise above 2x the 2021 rate.
 - Interventions multiply the no-intervention cause-specific mortality rate by a two-stage exponential decline: a slow annual reduction, then a fast annual reduction, bounded by an irreducible floor multiplier. The default parameters are slow start 2040, slow rate 0.015, fast start 2080, fast rate 0.10, and floor 0.01.
 - The two-stage shape is inspired by historical tuberculosis mortality declines, including the England and Wales series from Our World in Data: https://ourworldindata.org/grapher/death-rate-tuberculosis-england-wales
 - Explicit annual projection continues while trends or active interventions are still changing, then the tail hazard is frozen.

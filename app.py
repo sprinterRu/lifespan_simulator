@@ -25,8 +25,8 @@ from lifespan_simulator.data import (
 )
 from lifespan_simulator.simulation import (
     ScenarioMap,
-    TREND_FULL_YEARS,
-    TREND_TAPER_YEARS,
+    TREND_CEILING_MULTIPLIER_DEFAULT,
+    TREND_FLOOR_FRACTION_DEFAULT,
     build_scenario_map,
     project_cause_rates,
     project_total_rates,
@@ -512,7 +512,8 @@ def scenario_top_causes(
     age_band_start: int,
     scenario_map: ScenarioMap,
     trend_table: dict[int, dict[str, float]] | None = None,
-    trend_dampening: bool = False,
+    trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT,
+    trend_ceiling: float | None = TREND_CEILING_MULTIPLIER_DEFAULT,
     limit: int = 5,
 ) -> pd.DataFrame:
     """Rank causes by average scenario mortality within a chosen age band.
@@ -532,8 +533,11 @@ def scenario_top_causes(
         trend_table: Optional significant-slope lookup from
             :class:`lifespan_simulator.trends.TrendModel`. When present, cause
             rates used for ranking include historical trend adjustments.
-        trend_dampening: When true, trend adjustments used for ranking are
-            tapered and then frozen instead of extrapolating linearly forever.
+        trend_floor: Residual floor for declining trends, expressed as a
+            fraction of the age-specific 2021 baseline rate.
+        trend_ceiling: Maximum rate for growing trends, expressed as a
+            multiple of the age-specific 2021 baseline rate. ``None`` leaves
+            growing trends uncapped.
         limit: Maximum number of causes to return. The app uses the default of
             five to choose the automatic chart lines.
 
@@ -552,7 +556,8 @@ def scenario_top_causes(
         scenario_map,
         max_age=max(initial_age, band_end),
         trend_table=trend_table,
-        trend_dampening=trend_dampening,
+        trend_floor=trend_floor,
+        trend_ceiling=trend_ceiling,
     )
     band_projection = projection[(projection["age"] >= band_start) & (projection["age"] <= band_end)].copy()
     ranked = (
@@ -585,8 +590,7 @@ def render_intro(simulator_frame: pd.DataFrame) -> None:
             - The simulator starts from the 2021 age-specific mortality schedule.
             - Source five-year age-bucket rates are linearly interpolated across age-bucket midpoints to produce annual attained-age rates; the open-ended `95 years or over` bucket is held flat from age 95 onward.
             - The simulator tab has a default-on control for applying statistically significant 2011-2021 cause-age trends to future rates.
-            - Trend-adjusted rates use linear changes per 100,000 population and are floored at zero.
-            - Trend dampening applies fitted slopes fully for {TREND_FULL_YEARS} years, tapers them over {TREND_TAPER_YEARS} years, then freezes the cumulative trend adjustment.
+            - Trend-adjusted rates use linear changes per 100,000 population. Declining trends are floored as a configurable share of the 2021 cause-age rate, and growing trends are capped as a configurable multiple of that rate.
             - Active interventions multiply the no-intervention cause-specific rate by a two-stage exponential decline: a slow annual reduction, then a fast annual reduction, both bounded by an irreducible floor multiplier.
             - The two-stage intervention shape is inspired by historical tuberculosis mortality declines, such as the England and Wales series from [Our World in Data](https://ourworldindata.org/grapher/death-rate-tuberculosis-england-wales).
             - Mortality is treated as a constant annual hazard within each modeled one-year age interval.
@@ -627,30 +631,43 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
                 "before any active intervention multiplier is applied."
             ),
         )
-        trend_dampening = st.toggle(
-            "Dampen trend extrapolation",
-            value=True,
+        trend_floor = st.number_input(
+            "Trend floor",
+            min_value=0.0,
+            max_value=1.0,
+            value=TREND_FLOOR_FRACTION_DEFAULT,
+            step=0.05,
+            format="%.2f",
             disabled=not use_trends,
             help=(
-                f"Apply fitted slopes fully for {TREND_FULL_YEARS} years, taper them over "
-                f"{TREND_TAPER_YEARS} years, then freeze the cumulative trend adjustment."
+                "Declining trends cannot reduce a cause-age rate below this fraction of "
+                "its 2021 baseline rate. 0.15 means a 15% residual floor."
+            ),
+        )
+        trend_ceiling = st.number_input(
+            "Trend ceiling",
+            min_value=1.0,
+            max_value=10.0,
+            value=TREND_CEILING_MULTIPLIER_DEFAULT,
+            step=0.25,
+            format="%.2f",
+            disabled=not use_trends,
+            help=(
+                "Growing trends cannot raise a cause-age rate above this multiple of "
+                "its 2021 baseline rate. 2.0 means a 2x ceiling."
             ),
         )
         if use_trends:
-            dampening_note = (
-                f"Trend dampening is on: full for {TREND_FULL_YEARS} years, "
-                f"tapered for {TREND_TAPER_YEARS} years."
-                if trend_dampening
-                else "Trend dampening is off."
-            )
             st.caption(
                 f"Using {trend_model.significant_count} of {trend_model.total_count} significant cause-age trends; "
-                f"{dampening_note} Rates are floored at 0."
+                f"declining trends floor at {trend_floor:.0%} of 2021 rates and growing trends cap at "
+                f"{trend_ceiling:g}x."
             )
         else:
             st.caption("Using fixed 2021 cause-age rates before any active intervention multiplier is applied.")
     active_trend_table = trend_model.slope_table if use_trends else None
-    active_trend_dampening = bool(use_trends and trend_dampening)
+    active_trend_floor = float(trend_floor)
+    active_trend_ceiling = float(trend_ceiling)
     top_cause_age_bands = available_top_cause_age_bands(simulator_frame, initial_age)
     top_cause_age_starts = top_cause_age_bands["age_start"].astype(int).tolist()
     top_cause_age_label_lookup = top_cause_age_bands.set_index("age_start")["age_label"].to_dict()
@@ -783,14 +800,16 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
         simulator_frame,
         initial_age,
         trend_table=active_trend_table,
-        trend_dampening=active_trend_dampening,
+        trend_floor=active_trend_floor,
+        trend_ceiling=active_trend_ceiling,
     )
     scenario_result = simulate_survival(
         simulator_frame,
         initial_age,
         scenario_map,
         trend_table=active_trend_table,
-        trend_dampening=active_trend_dampening,
+        trend_floor=active_trend_floor,
+        trend_ceiling=active_trend_ceiling,
     )
     top_scenario_causes = scenario_top_causes(
         simulator_frame,
@@ -798,7 +817,8 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
         top_cause_age_start,
         scenario_map,
         trend_table=active_trend_table,
-        trend_dampening=active_trend_dampening,
+        trend_floor=active_trend_floor,
+        trend_ceiling=active_trend_ceiling,
         limit=5,
     )
     top_scenario_names = top_scenario_causes["cause_name"].tolist()
@@ -832,7 +852,8 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
                 scenario_map,
                 horizon,
                 trend_table=active_trend_table,
-                trend_dampening=active_trend_dampening,
+                trend_floor=active_trend_floor,
+                trend_ceiling=active_trend_ceiling,
             )
             st.plotly_chart(build_cause_projection_figure(cause_projection), use_container_width=True)
             st.caption(
@@ -849,7 +870,8 @@ def render_simulator_tab(simulator_frame: pd.DataFrame, trend_model: TrendModel)
             scenario_map,
             horizon,
             trend_table=active_trend_table,
-            trend_dampening=active_trend_dampening,
+            trend_floor=active_trend_floor,
+            trend_ceiling=active_trend_ceiling,
         )
         st.plotly_chart(build_total_rate_figure(total_projection), use_container_width=True)
 

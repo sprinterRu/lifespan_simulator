@@ -21,11 +21,12 @@ START_YEAR = 2021
 # Dividing by this value converts a rate into the annual hazard used by the
 # exponential survival model.
 RATE_SCALE = 100_000.0
-# With trend dampening enabled, fitted annual slopes are applied fully for the
-# first projection window, linearly tapered to zero during the second window,
-# and then held fixed.
-TREND_FULL_YEARS = 15
-TREND_TAPER_YEARS = 15
+# Significant fitted slopes remain linear, but the resulting rates are bounded
+# relative to the 2021 age-specific baseline. Declining trends cannot reduce a
+# cause below this residual share, and growing trends cannot exceed this
+# multiple of the same baseline.
+TREND_FLOOR_FRACTION_DEFAULT = 0.15
+TREND_CEILING_MULTIPLIER_DEFAULT = 2.0
 # Labels are death-distribution percentiles. For example, p75 is the age by
 # which 75% of the synthetic cohort has died.
 PERCENTILES = {
@@ -83,9 +84,9 @@ class SimulationResult:
             columns and extends into the terminal tail far enough to show the
             modeled percentile ages.
         tail_start_age: First attained age handled by the terminal tail. It is
-            computed by :func:`simulate_survival` from age 95, any explicit
-            trend horizon, and any later year when active interventions reach
-            their mortality floor.
+            computed by :func:`simulate_survival` from age 95, the explicit
+            trend projection horizon when trends are enabled, and any later
+            year when active interventions reach their mortality floor.
         tail_hazard: Constant annual hazard assumed from ``tail_start_age``
             onward. It comes from the total resolved mortality rate at the tail
             boundary divided by :data:`RATE_SCALE`.
@@ -198,20 +199,35 @@ def _counterfactual_rate(
     cause_code: str,
     rate_table: RateTable,
     trend_table: TrendTable | None = None,
-    trend_dampening: bool = False,
+    trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT,
+    trend_ceiling: float | None = TREND_CEILING_MULTIPLIER_DEFAULT,
 ) -> float:
     """Resolve the no-intervention rate before applying a scenario multiplier."""
     baseline_rate = _interpolate_rate(age, rate_table.get(cause_code, ()))
     if trend_table is not None:
         slope = _interpolate_trend_slope(age, cause_code, rate_table.get(cause_code, ()), trend_table)
         years_since_start = calendar_year - START_YEAR
-        trend_years = (
-            dampened_trend_years(years_since_start)
-            if trend_dampening
-            else float(years_since_start)
-        )
-        return max(0.0, baseline_rate + slope * trend_years)
+        projected_rate = baseline_rate + slope * float(years_since_start)
+        return _apply_trend_bounds(baseline_rate, projected_rate, trend_floor, trend_ceiling)
     return baseline_rate
+
+
+def _apply_trend_bounds(
+    baseline_rate: float,
+    projected_rate: float,
+    trend_floor: float,
+    trend_ceiling: float | None,
+) -> float:
+    """Clamp a linear trend projection to residual floor and growth ceiling."""
+    if baseline_rate <= 0.0:
+        return max(0.0, projected_rate)
+
+    floor_rate = baseline_rate * _clamp_unit_interval(float(trend_floor))
+    ceiling_rate = inf
+    if trend_ceiling is not None:
+        ceiling_rate = baseline_rate * max(1.0, float(trend_ceiling))
+
+    return min(ceiling_rate, max(floor_rate, projected_rate))
 
 
 def _interpolate_rate(age: int | float, points: tuple[AgeRatePoint, ...]) -> float:
@@ -336,7 +352,8 @@ def _resolve_rate(
     rate_table: RateTable,
     scenario_map: ScenarioMap,
     trend_table: TrendTable | None = None,
-    trend_dampening: bool = False,
+    trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT,
+    trend_ceiling: float | None = TREND_CEILING_MULTIPLIER_DEFAULT,
 ) -> float:
     """Return the mortality rate that applies for one cause at one age/year.
 
@@ -359,9 +376,11 @@ def _resolve_rate(
             ``lifespan_simulator.trends.build_trend_model``. When present, it
             supplies significant linear annual slopes by age bucket and cause
             code. Non-significant cause-age trends are represented as ``0.0``.
-        trend_dampening: When true, the fitted slope is applied fully for
-            :data:`TREND_FULL_YEARS`, tapered to zero over
-            :data:`TREND_TAPER_YEARS`, and then held fixed.
+        trend_floor: Residual floor for declining trends, expressed as a
+            fraction of the age-specific 2021 baseline rate.
+        trend_ceiling: Maximum rate for growing trends, expressed as a
+            multiple of the age-specific 2021 baseline rate. ``None`` leaves
+            growing trends uncapped.
 
     Returns:
         The applicable mortality rate per 100,000 population. Historical trend
@@ -374,37 +393,13 @@ def _resolve_rate(
         cause_code,
         rate_table,
         trend_table,
-        trend_dampening,
+        trend_floor,
+        trend_ceiling,
     )
     scenario = scenario_map.get(cause_code)
     if scenario is None:
         return counterfactual_rate
     return counterfactual_rate * _intervention_multiplier(calendar_year, scenario)
-
-
-def dampened_trend_years(
-    years_since_start: int | float,
-    full_years: int = TREND_FULL_YEARS,
-    taper_years: int = TREND_TAPER_YEARS,
-) -> float:
-    """Return the cumulative trend exposure after linear slope tapering.
-
-    A fitted annual slope is applied at full strength through ``full_years``.
-    During the following ``taper_years``, the marginal slope contribution fades
-    linearly to zero. After that, the cumulative trend contribution is frozen.
-    """
-    years = float(years_since_start)
-    if years <= full_years:
-        return years
-    if taper_years <= 0:
-        return float(full_years)
-
-    taper_elapsed = min(years - full_years, taper_years)
-    dampened_years = full_years + taper_elapsed - (taper_elapsed**2 / (2 * taper_years))
-
-    if years > full_years + taper_years:
-        return full_years + (taper_years / 2)
-    return dampened_years
 
 
 def project_cause_rates(
@@ -415,7 +410,8 @@ def project_cause_rates(
     max_age: int,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
-    trend_dampening: bool = False,
+    trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT,
+    trend_ceiling: float | None = TREND_CEILING_MULTIPLIER_DEFAULT,
 ) -> pd.DataFrame:
     """Project baseline and scenario rates by attained age for selected causes.
 
@@ -439,8 +435,11 @@ def project_cause_rates(
             ``build_trend_model``. When present, both the no-intervention
             baseline projection and scenario projection include historical
             trend adjustments before scenario interventions are applied.
-        trend_dampening: When true, trend adjustments are tapered and then
-            frozen instead of extrapolating linearly forever.
+        trend_floor: Residual floor for declining trends, expressed as a
+            fraction of the age-specific 2021 baseline rate.
+        trend_ceiling: Maximum rate for growing trends, expressed as a
+            multiple of the age-specific 2021 baseline rate. ``None`` leaves
+            growing trends uncapped.
 
     Returns:
         DataFrame with one row per projected age and selected cause. Columns
@@ -469,7 +468,8 @@ def project_cause_rates(
                         rate_table,
                         {},
                         trend_table,
-                        trend_dampening,
+                        trend_floor,
+                        trend_ceiling,
                     ),
                     "scenario_rate": _resolve_rate(
                         age,
@@ -478,7 +478,8 @@ def project_cause_rates(
                         rate_table,
                         scenario_map,
                         trend_table,
-                        trend_dampening,
+                        trend_floor,
+                        trend_ceiling,
                     ),
                 }
             )
@@ -493,7 +494,8 @@ def project_total_rates(
     max_age: int,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
-    trend_dampening: bool = False,
+    trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT,
+    trend_ceiling: float | None = TREND_CEILING_MULTIPLIER_DEFAULT,
 ) -> pd.DataFrame:
     """Project total baseline and scenario mortality rates by attained age.
 
@@ -517,8 +519,11 @@ def project_total_rates(
             ``build_trend_model``. When present, both total series include
             historical trend adjustments, and the scenario series additionally
             applies active interventions.
-        trend_dampening: When true, trend adjustments are tapered and then
-            frozen instead of extrapolating linearly forever.
+        trend_floor: Residual floor for declining trends, expressed as a
+            fraction of the age-specific 2021 baseline rate.
+        trend_ceiling: Maximum rate for growing trends, expressed as a
+            multiple of the age-specific 2021 baseline rate. ``None`` leaves
+            growing trends uncapped.
 
     Returns:
         DataFrame with one row per projected attained age. It contains
@@ -534,11 +539,29 @@ def project_total_rates(
     for age in range(initial_age, max_age + 1):
         calendar_year = start_year + (age - initial_age)
         baseline_total = sum(
-            _resolve_rate(age, calendar_year, code, rate_table, {}, trend_table, trend_dampening)
+            _resolve_rate(
+                age,
+                calendar_year,
+                code,
+                rate_table,
+                {},
+                trend_table,
+                trend_floor,
+                trend_ceiling,
+            )
             for code in cause_codes
         )
         scenario_total = sum(
-            _resolve_rate(age, calendar_year, code, rate_table, scenario_map, trend_table, trend_dampening)
+            _resolve_rate(
+                age,
+                calendar_year,
+                code,
+                rate_table,
+                scenario_map,
+                trend_table,
+                trend_floor,
+                trend_ceiling,
+            )
             for code in cause_codes
         )
         rows.append(
@@ -559,7 +582,8 @@ def simulate_survival(
     scenario_map: ScenarioMap | None = None,
     start_year: int = START_YEAR,
     trend_table: TrendTable | None = None,
-    trend_dampening: bool = False,
+    trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT,
+    trend_ceiling: float | None = TREND_CEILING_MULTIPLIER_DEFAULT,
 ) -> SimulationResult:
     """Simulate cohort survival under piecewise-constant annual hazards.
 
@@ -580,9 +604,12 @@ def simulate_survival(
         trend_table: Optional significant-slope lookup from
             ``build_trend_model``. When present, cause rates without active
             interventions are projected as linear changes from the 2021
-            baseline and floored at zero.
-        trend_dampening: When true, trend adjustments are tapered and then
-            frozen instead of extrapolating linearly forever.
+            baseline, bounded by ``trend_floor`` and ``trend_ceiling``.
+        trend_floor: Residual floor for declining trends, expressed as a
+            fraction of the age-specific 2021 baseline rate.
+        trend_ceiling: Maximum rate for growing trends, expressed as a
+            multiple of the age-specific 2021 baseline rate. ``None`` leaves
+            growing trends uncapped.
 
     Returns:
         A :class:`SimulationResult` containing the annual survival projection,
@@ -617,7 +644,8 @@ def simulate_survival(
                 rate_table,
                 scenario_map,
                 trend_table,
-                trend_dampening,
+                trend_floor,
+                trend_ceiling,
             )
             for code in cause_codes
         )
@@ -648,7 +676,8 @@ def simulate_survival(
             rate_table,
             scenario_map,
             trend_table,
-            trend_dampening,
+            trend_floor,
+            trend_ceiling,
         )
         for code in cause_codes
     )
@@ -690,8 +719,9 @@ def _compute_percentiles(
             ``hazard``, ``survival_start``, and ``survival_end``.
         tail_start_age: First age handled by the open-ended terminal tail. It
             is computed in :func:`simulate_survival` from the source data's
-            ``95+`` bucket, any explicit trend horizon, and any later year
-            when active intervention multipliers stop changing.
+            ``95+`` bucket, the explicit trend projection horizon when trends
+            are enabled, and any later year when active intervention
+            multipliers stop changing.
         tail_hazard: Constant annual hazard used after ``tail_start_age``. It
             is computed in :func:`simulate_survival` by resolving all cause
             rates at the tail boundary and dividing their total by
