@@ -48,8 +48,9 @@ class PandemicConfig:
 class ProjectionConfig:
     start_year: int = BASE_YEAR
     calibrate: bool = True
-    old_age_model: Literal["kannisto", "gompertz", "flat"] = "kannisto"
+    old_age_model: Literal["individual", "kannisto", "gompertz", "flat"] = "individual"
     old_age_slope_multiplier: float = 1.0
+    decline_residual_fraction: float = 0.0
     pandemic: PandemicConfig = field(default_factory=PandemicConfig)
     trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT
     trend_ceiling: float = TREND_CEILING_MULTIPLIER_DEFAULT
@@ -60,8 +61,13 @@ class ProjectionConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.start_year, int) or not BASE_YEAR <= self.start_year <= 2120:
             raise ValueError("Start year must be an integer between 2021 and 2120")
-        if self.old_age_model not in {"kannisto", "gompertz", "flat"}:
+        if self.old_age_model not in {"individual", "kannisto", "gompertz", "flat"}:
             raise ValueError("Unknown old-age model")
+        if (
+            not isfinite(self.decline_residual_fraction)
+            or not 0 <= self.decline_residual_fraction < 1
+        ):
+            raise ValueError("Declining-tail residual must be finite and in [0, 1)")
         if (
             not isfinite(self.old_age_slope_multiplier)
             or not 0.25 <= self.old_age_slope_multiplier <= 2

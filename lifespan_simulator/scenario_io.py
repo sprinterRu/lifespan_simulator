@@ -6,6 +6,7 @@ from math import isfinite
 
 import pandas as pd
 
+from .data import DEMENTIA_NAME
 from .interventions import ScenarioMap
 
 ACTIVE_INTERVENTION_COLUMNS = (
@@ -59,6 +60,8 @@ def parse_interventions_csv(
     if frame.empty:
         raise ValueError("The uploaded CSV does not contain any interventions.")
 
+    frame = _merge_legacy_dementia_rows(frame, all_cause_options)
+
     cause_names: list[str] = []
     loaded_inputs: dict[str, dict[str, float | int]] = {}
 
@@ -90,6 +93,34 @@ def parse_interventions_csv(
         }
 
     return cause_names, loaded_inputs
+
+
+def _merge_legacy_dementia_rows(frame: pd.DataFrame, options: dict[str, str]) -> pd.DataFrame:
+    """Migrate only lossless pairs; never silently broaden a one-cause treatment."""
+    if DEMENTIA_NAME not in options:
+        return frame
+    names = frame.Cause.astype(str).str.strip()
+    legacy = names.isin(["Dementia", "Alzheimer disease"])
+    if not legacy.any():
+        return frame
+    rows = frame.loc[legacy]
+    matching = (
+        len(rows) == 2
+        and set(names[legacy]) == {"Dementia", "Alzheimer disease"}
+        and not names.eq(DEMENTIA_NAME).any()
+        and all(
+            pd.to_numeric(rows[column], errors="coerce").nunique(dropna=False) == 1
+            for column in ACTIVE_INTERVENTION_COLUMNS[1:]
+        )
+    )
+    if not matching:
+        raise ValueError(
+            f"Dementia and Alzheimer disease are now combined. Use one '{DEMENTIA_NAME}' row. "
+            "Legacy rows can be merged only when both causes have identical settings."
+        )
+    combined = rows.iloc[[0]].copy()
+    combined["Cause"] = DEMENTIA_NAME
+    return pd.concat([frame.loc[~legacy], combined], ignore_index=True)
 
 
 def parse_csv_year(row: dict[str, object], column: str, row_number: int) -> int:

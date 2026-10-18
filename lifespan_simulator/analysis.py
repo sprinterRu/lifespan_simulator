@@ -11,10 +11,13 @@ from .config import PandemicConfig, ProjectionConfig
 from .interventions import ScenarioMap, build_scenario_map
 from .mortality import MortalityModel
 from .simulation import simulate_survival
+from .tails import CauseTailFit
 
 
 def compare_cause_totals(frame: pd.DataFrame, official_totals: pd.DataFrame) -> pd.DataFrame:
     """Audit the unmodified CSV before any life-table calibration."""
+    frame = frame[frame.age_start < 95]
+    official_totals = official_totals[official_totals.age_code != "Y_GE95"]
     totals = frame.groupby(["age_code", "age_start", "age_display"], as_index=False).rate.sum()
     audit = totals.merge(
         official_totals[["age_code", "rate"]],
@@ -30,20 +33,30 @@ def compare_cause_totals(frame: pd.DataFrame, official_totals: pd.DataFrame) -> 
     return audit.sort_values("age_start").reset_index(drop=True)
 
 
-def compare_life_expectancy(frame: pd.DataFrame, official: pd.DataFrame) -> pd.DataFrame:
+def compare_life_expectancy(
+    frame: pd.DataFrame,
+    official: pd.DataFrame,
+    tail_fits: dict[str, CauseTailFit] | None = None,
+    decline_residual_fraction: float = 0,
+) -> pd.DataFrame:
     """Compare period e(x) with no secular trend and the observed pandemic level.
 
     These checks validate reconstruction/calibration, not future predictive skill.
-    Open-age LIFEXP is remaining life from 95; open-age Mx is not M(95).
+    Only closed-age reference values through 94 are used.
     """
-    model = MortalityModel(frame, official_life_table=official)
-    fixed = ProjectionConfig(pandemic=PandemicConfig(mode="hold_2021"), trend_horizon_years=0)
+    model = MortalityModel(frame, official_life_table=official, tail_fits=tail_fits)
+    fixed = ProjectionConfig(
+        old_age_model="kannisto",
+        pandemic=PandemicConfig(mode="hold_2021"),
+        trend_horizon_years=0,
+        decline_residual_fraction=decline_residual_fraction,
+    )
     reference = official[official.indicator == "LIFEXP"].set_index("age").value
     rows = []
-    for age in (35, 65, 85, 95):
+    for age in (35, 65, 85, 94):
         row = {
             "age": age,
-            "official_remaining_years": float(reference.loc[str(age) if age < 95 else "95+"]),
+            "official_remaining_years": float(reference.loc[str(age)]),
         }
         for label, config in [
             ("uncalibrated_flat", replace(fixed, calibrate=False, old_age_model="flat")),
@@ -52,6 +65,13 @@ def compare_life_expectancy(frame: pd.DataFrame, official: pd.DataFrame) -> pd.D
         ]:
             row[label] = simulate_survival(model, age, config=config).remaining_life_expectancy
         row["calibrated_difference"] = row["calibrated_kannisto"] - row["official_remaining_years"]
+        if tail_fits is not None:
+            row["calibrated_individual"] = simulate_survival(
+                model, age, config=replace(fixed, old_age_model="individual")
+            ).remaining_life_expectancy
+            row["individual_difference"] = (
+                row["calibrated_individual"] - row["official_remaining_years"]
+            )
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -69,7 +89,7 @@ def sensitivity_variants(
         ("COVID: 10% residual, half-life 10y", PandemicConfig(half_life_years=10)),
     ]:
         variants.append((label, replace(config, pandemic=pandemic), scenarios))
-    for mode in ("flat", "gompertz", "kannisto"):
+    for mode in ("individual", "flat", "gompertz", "kannisto"):
         if mode != config.old_age_model:
             variants.append((f"Old age: {mode}", replace(config, old_age_model=mode), scenarios))
     for slope in (0.75, 1.25):
@@ -80,6 +100,16 @@ def sensitivity_variants(
                 scenarios,
             )
         )
+    if config.old_age_model == "individual":
+        for residual in (0.0, 0.25):
+            if residual != config.decline_residual_fraction:
+                variants.append(
+                    (
+                        f"Declining tails: {residual:.0%} residual",
+                        replace(config, decline_residual_fraction=residual),
+                        scenarios,
+                    )
+                )
     for floor in (0.05, 0.30):
         variants.append(
             (f"Trend floor: {floor:.0%}", replace(config, trend_floor=floor), scenarios)

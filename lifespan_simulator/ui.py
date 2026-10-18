@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from math import inf, isfinite
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -25,19 +26,30 @@ from .config import (
     PandemicConfig,
     ProjectionConfig,
 )
-from .data import get_display_horizon, load_official_cause_totals
-from .interventions import ScenarioMap, build_scenario_map
+from .data import (
+    DEMENTIA_CODE,
+    DEMENTIA_NAME,
+    get_display_horizon,
+    load_official_cause_totals,
+    merge_dementia,
+)
+from .interventions import (
+    FAST_NET_REDUCTION_DEFAULT,
+    ScenarioMap,
+    build_scenario_map,
+    default_fast_rate,
+)
 from .mortality import MortalityModel
 from .scenario_io import active_interventions_frame, parse_interventions_csv
 from .simulation import project_cause_rates, project_total_rates, simulate_survival
+from .tails import CauseTailFit, TailCurve, tail_fit_table
 from .trends import TrendModel, build_trend_frame
 
 EXPLORER_CAUSE_SELECTION_KEY = "explorer_selected_causes"
 INTERVENTION_CAUSES_KEY = "simulator_intervention_causes"
 SLOW_START_YEAR_DEFAULT = 2040
 SLOW_RATE_DEFAULT = 0.015
-FAST_START_YEAR_DEFAULT = 2080
-FAST_RATE_DEFAULT = 0.10
+FAST_START_YEAR_DEFAULT = 2070
 FLOOR_DEFAULT = 0.01
 
 
@@ -106,6 +118,7 @@ def apply_loaded_interventions(
         st.session_state[f"slow_rate_{cause_code}"] = float(config["slow_rate"])
         st.session_state[f"fast_start_year_{cause_code}"] = int(config["fast_start_year"])
         st.session_state[f"fast_rate_{cause_code}"] = float(config["fast_rate"])
+        st.session_state[f"fast_rate_custom_{cause_code}"] = True
         st.session_state[f"floor_{cause_code}"] = float(config["floor"])
 
 
@@ -159,7 +172,8 @@ def available_top_cause_age_bands(simulator_frame: pd.DataFrame, initial_age: in
         .reset_index(drop=True)
     )
     band_ends = age_bands["age_end"].fillna(age_bands["age_start"])
-    return age_bands[band_ends >= initial_age].reset_index(drop=True)
+    eligible = age_bands[band_ends >= initial_age]
+    return (eligible if not eligible.empty else age_bands.tail(1)).reset_index(drop=True)
 
 
 def default_top_cause_age_start(age_starts: list[int]) -> int:
@@ -176,6 +190,7 @@ def age_band_details(simulator_frame: pd.DataFrame, age_start: int) -> tuple[int
 
 def render_explorer_tab(raw_frame: pd.DataFrame) -> None:
     """Render the historical mortality-rate trend explorer."""
+    raw_frame = raw_frame[raw_frame.age_start < 95]
     age_labels = (
         raw_frame.drop_duplicates("age_start").sort_values("age_start")["age_label"].tolist()
     )
@@ -234,8 +249,31 @@ def render_explorer_tab(raw_frame: pd.DataFrame) -> None:
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, width="stretch")
 
 
+def mark_fast_rate_custom(cause_code: str) -> None:
+    """A user edit is authoritative, even when it equals a previous default."""
+    st.session_state[f"fast_rate_custom_{cause_code}"] = True
+
+
+def prepare_fast_rate(cause_code: str, suggested: float) -> str:
+    """Refresh automatic defaults as shapes change; preserve edits and imports."""
+    key = f"fast_rate_{cause_code}"
+    custom_key = f"fast_rate_custom_{cause_code}"
+    if key not in st.session_state:
+        st.session_state[key] = suggested
+        st.session_state[custom_key] = False
+    elif custom_key not in st.session_state:
+        # Existing sessions predate provenance tracking; do not guess whether
+        # their value was edited. The explicit reset button adopts new defaults.
+        st.session_state[custom_key] = True
+    elif not st.session_state[custom_key]:
+        st.session_state[key] = suggested
+    return key
+
+
 def render_interventions(
-    intervention_causes: list[str], all_cause_options: dict[str, str]
+    intervention_causes: list[str],
+    all_cause_options: dict[str, str],
+    suggested_fast_rates: dict[str, float],
 ) -> ScenarioMap:
     """Edit intervention parameters, keeping CSV imports and widgets in sync."""
     scenario_inputs: dict[str, dict[str, float | int]] = {}
@@ -257,7 +295,9 @@ def render_interventions(
             column.caption(label)
         st.caption(
             "Slow floor limits only gradual improvements. Fast compounds on the attained slow multiplier "
-            "without a floor: 0.1 leaves 90% each year; 1 eliminates this cause from the fast start year."
+            "without a floor. Values are reductions relative to the untreated rate; 1 eliminates the cause. "
+            "Exponential-tail defaults offset ageing plus 10% net reduction per year. Other families default to 10%. "
+            "The net target applies after age 94 with calendar factors held fixed."
         )
         for cause_name in intervention_causes:
             cause_code = all_cause_options[cause_name]
@@ -301,17 +341,24 @@ def render_interventions(
                     label_visibility="collapsed",
                 )
             with fast_rate_col:
+                suggested = suggested_fast_rates[cause_code]
+                fast_rate_key = prepare_fast_rate(cause_code, suggested)
                 fast_rate = st.number_input(
                     f"Fast annual reduction for {cause_name}",
                     min_value=0.0,
                     max_value=1.0,
-                    value=FAST_RATE_DEFAULT,
+                    value=None,
                     step=0.01,
-                    format="%.3f",
-                    key=f"fast_rate_{cause_code}",
-                    help="Annual reduction after the breakthrough, without a floor. 0.1 means 10% per year.",
+                    format="%.6f",
+                    key=fast_rate_key,
+                    on_change=mark_fast_rate_custom,
+                    args=(cause_code,),
+                    help=f"Suggested for the active age curve: {suggested:.2%}. Manual and imported values are preserved. 0.1 means a 10% treatment reduction before age growth.",
                     label_visibility="collapsed",
                 )
+                if fast_rate is None:
+                    st.error(f"Enter a fast annual reduction for {cause_name}.")
+                    st.stop()
             with floor_col:
                 floor = st.number_input(
                     f"Slow-stage floor for {cause_name}",
@@ -350,11 +397,12 @@ def render_projection_controls() -> tuple[int, bool, ProjectionConfig]:
             )
             old_age = st.selectbox(
                 "Mortality after age 94",
-                ["kannisto", "gompertz", "flat"],
+                ["individual", "kannisto", "gompertz", "flat"],
                 format_func=lambda x: {
+                    "individual": "Individual cause trajectories (fitted)",
                     "kannisto": "Kannisto (logistic)",
                     "gompertz": "Gompertz (exponential)",
-                    "flat": "Flat 95+ (comparison only)",
+                    "flat": "Flat after 94 (comparison only)",
                 }[x],
             )
             pandemic_mode = st.selectbox(
@@ -378,6 +426,15 @@ def render_projection_controls() -> tuple[int, bool, ProjectionConfig]:
                 disabled=pandemic_mode != "fade",
             )
         with right:
+            decline_residual = st.slider(
+                "Declining-tail residual share",
+                0.0,
+                0.5,
+                0.0,
+                0.05,
+                disabled=old_age != "individual",
+                help="Baseline declining curves approach this share of their age-94 rate. Fast interventions can still reduce it without a floor.",
+            )
             trend_floor = st.number_input(
                 "Trend floor", 0.0, 1.0, 0.15, 0.05, disabled=not use_trends
             )
@@ -407,6 +464,7 @@ def render_projection_controls() -> tuple[int, bool, ProjectionConfig]:
             start_year=int(start_year),
             calibrate=calibrate,
             old_age_model=old_age,
+            decline_residual_fraction=decline_residual,
             pandemic=PandemicConfig(pandemic_mode, half_life, residual),
             trend_floor=trend_floor,
             trend_ceiling=trend_ceiling,
@@ -416,15 +474,30 @@ def render_projection_controls() -> tuple[int, bool, ProjectionConfig]:
     )
 
 
-def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: TrendModel) -> None:
+def render_simulator_tab(
+    frame: pd.DataFrame,
+    official: pd.DataFrame,
+    trend: TrendModel,
+    tails: dict[str, CauseTailFit],
+) -> tuple[dict[str, CauseTailFit], ProjectionConfig]:
     initial_age, use_trends, config = render_projection_controls()
-    model = MortalityModel(frame, trend.slope_table if use_trends else None, official)
+    active_tails = render_tail_overrides(frame, tails, config.old_age_model == "individual")
+    model = MortalityModel(frame, trend.slope_table if use_trends else None, official, active_tails)
+    if config.old_age_model == "individual":
+        st.caption(
+            "Each cause follows its own fitted tail after 94. See Cause trajectories for families, "
+            "validation errors and fallback assumptions. Dementia includes Alzheimer disease."
+        )
     if use_trends:
         st.caption(
             f"Using {trend.significant_count} of {trend.total_count} non-COVID cause-age trends fitted through 2019. "
             "The baseline is conditional on survival to the selected starting age and includes the chosen COVID path."
         )
     options = cause_options(frame)
+    exponential_growth = model.exponential_age_growth(config)
+    suggested_fast_rates = {
+        code: default_fast_rate(exponential_growth.get(code, 0.0)) for code in model.codes
+    }
     with st.expander("Import intervention settings"):
         uploaded = st.file_uploader("Load active interventions CSV", type=["csv"])
         if st.button("Load interventions", disabled=uploaded is None):
@@ -434,10 +507,31 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
                 st.success(f"Loaded {len(names)} intervention(s).")
             except (pd.errors.EmptyDataError, pd.errors.ParserError, ValueError) as error:
                 st.error(f"Could not load interventions CSV. {error}")
+    previous = st.session_state.get(INTERVENTION_CAUSES_KEY, [])
+    if any(name not in options for name in previous):
+        st.session_state[INTERVENTION_CAUSES_KEY] = [name for name in previous if name in options]
+        st.warning(
+            "The cause list changed. Dementia and Alzheimer disease now share one intervention; "
+            "select the combined group to set its parameters."
+        )
+    if st.button(
+        "Select all exponentially growing causes",
+        disabled=not exponential_growth,
+        help="Adds every cause with a positive exponential slope in the active model, including custom trajectories. Existing selections are kept.",
+    ):
+        st.session_state[INTERVENTION_CAUSES_KEY] = sorted(
+            set(st.session_state.get(INTERVENTION_CAUSES_KEY, []))
+            | {model.names[code] for code in exponential_growth}
+        )
     selected = st.multiselect(
         "Causes to modify in the scenario", sorted(options), key=INTERVENTION_CAUSES_KEY
     )
-    scenarios = render_interventions(selected, options)
+    if st.button("Reset selected fast rates to defaults", disabled=not selected):
+        for name in selected:
+            code = options[name]
+            st.session_state[f"fast_rate_{code}"] = suggested_fast_rates[code]
+            st.session_state[f"fast_rate_custom_{code}"] = False
+    scenarios = render_interventions(selected, options, suggested_fast_rates)
     baseline = simulate_survival(model, initial_age, config=config)
     scenario = simulate_survival(model, initial_age, scenarios, config) if scenarios else baseline
 
@@ -522,12 +616,14 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         format_func=labels.get,
     )
     band_start, band_end, _ = age_band_details(frame, ranking_age)
+    if initial_age > band_end:
+        st.caption(f"Ranking uses extrapolated rates at the initial age {initial_age}.")
     horizon = max(get_display_horizon(initial_age), band_end)
     all_rates = project_cause_rates(
         model, initial_age, list(model.codes), scenarios, horizon, config
     )
     ranked = (
-        all_rates[all_rates.age.between(max(initial_age, band_start), band_end)]
+        all_rates[all_rates.age.between(max(initial_age, band_start), max(initial_age, band_end))]
         .groupby("cause_code")
         .scenario_rate.mean()
         .nlargest(5)
@@ -583,8 +679,15 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         "projection": asdict(config),
         "interventions": {code: value._asdict() for code, value in scenarios.items()},
         "intervention_floor_applies_to": "slow stage only",
+        "fast_default_policy": {
+            "net_annual_reduction_for_exponential_tails": FAST_NET_REDUCTION_DEFAULT,
+            "formula": "1 - (1 - net_reduction) * exp(-age_log_growth)",
+            "suggested_rates": suggested_fast_rates,
+            "scope": "Active exponential age tails after 94; calendar trends and COVID changes are not compensated.",
+        },
         "historical_trends": "2011–2019" if use_trends else "disabled",
         "reference_population": "Spain, males, 2021",
+        "cause_tail_fits": {code: fit.record() for code, fit in model.tail_fits.items()},
     }
     st.download_button(
         "Download model assumptions JSON",
@@ -593,6 +696,98 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         "application/json",
     )
     render_sensitivity(model, initial_age, scenarios, config)
+    return active_tails, config
+
+
+def render_tail_overrides(
+    frame: pd.DataFrame, fitted: dict[str, CauseTailFit], enabled: bool
+) -> dict[str, CauseTailFit]:
+    """Keep user scenarios separate from cached, automatic fit results."""
+    active = dict(fitted)
+    with st.expander("Override individual cause trajectories"):
+        st.caption(
+            "Optional scenario assumptions. Overrides also appear in Cause trajectories and exports. "
+            "Their validation scores are cleared because they are no longer the automatic fit."
+        )
+        dementia = fitted.get(DEMENTIA_CODE)
+        if dementia is not None and dementia.alternative_curve is not None:
+            choice = st.radio(
+                "Dementia age trajectory",
+                ["Exponent fitted at 70–89 (default)", "Sigmoid fitted at 70–94 (comparison)"],
+                disabled=not enabled,
+                help="The default extrapolates the younger-age trend. The sigmoid tests a saturation assumption.",
+            )
+            if enabled and choice.startswith("Sigmoid"):
+                active[DEMENTIA_CODE] = replace(
+                    dementia,
+                    curve=dementia.alternative_curve,
+                    fit_ages=dementia.alternative_fit_ages,
+                    status="Comparison scenario",
+                    reason="Sigmoid fitted at 70–94. Its better near-age predictions do not establish a remote plateau.",
+                    validation_log_rmse=dementia.alternative_log_rmse,
+                    alternative=dementia.curve.kind,
+                    alternative_curve=dementia.curve,
+                    alternative_fit_ages=dementia.fit_ages,
+                    alternative_log_rmse=None,
+                )
+        options = cause_options(frame)
+        selected = st.multiselect(
+            "Causes with custom age trajectories",
+            sorted(options),
+            disabled=not enabled,
+        )
+        for name in selected:
+            code = options[name]
+            original = active[code]
+            families = ["exponent", "sigmoid", "plateau", "decline"]
+            left, middle, right = st.columns(3)
+            family = left.selectbox(
+                f"Tail family for {name}",
+                families,
+                index=families.index(original.curve.kind),
+                key=f"tail_family_{code}_{original.curve.kind}",
+                disabled=not enabled,
+            )
+            initial_curve = original.curve
+            if original.alternative_curve is not None and original.alternative_curve.kind == family:
+                initial_curve = original.alternative_curve
+            parameter_key = f"{code}_{original.curve.kind}_{family}"
+            slope = middle.number_input(
+                f"Tail slope for {name}",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(initial_curve.slope),
+                step=0.01,
+                key=f"tail_slope_{parameter_key}",
+                disabled=not enabled or family == "plateau",
+                help="Exponent/decline: logarithmic rate change per year. Sigmoid: logistic shape slope.",
+            )
+            ratio = right.number_input(
+                f"Plateau / age-94 rate for {name}",
+                min_value=1.0,
+                max_value=1000.0,
+                value=float(initial_curve.asymptote_ratio)
+                if initial_curve.kind == "sigmoid"
+                else 2.0,
+                step=0.5,
+                key=f"tail_plateau_{parameter_key}",
+                disabled=not enabled or family != "sigmoid",
+            )
+            if enabled:
+                active[code] = replace(
+                    original,
+                    curve=TailCurve(family, slope, ratio),
+                    fit_ages="manual",
+                    status="Manual override",
+                    reason="User-specified tail shape; not selected by validation.",
+                    validation_log_rmse=None,
+                    year_agreement=None,
+                    alternative=original.curve.kind,
+                    alternative_curve=original.curve,
+                    alternative_fit_ages=original.fit_ages,
+                    alternative_log_rmse=original.validation_log_rmse,
+                )
+    return active
 
 
 def render_sensitivity(
@@ -638,7 +833,12 @@ def render_sensitivity(
     )
 
 
-def render_validation_tab(frame: pd.DataFrame, official: pd.DataFrame) -> None:
+def render_validation_tab(
+    frame: pd.DataFrame,
+    official: pd.DataFrame,
+    tails: dict[str, CauseTailFit],
+    config: ProjectionConfig,
+) -> None:
     st.subheader("Reference checks: Spain, males, 2021")
     st.markdown(
         "Reference snapshots: [Eurostat life tables](https://ec.europa.eu/eurostat/databrowser/view/demo_mlifetable/default/table) "
@@ -666,24 +866,26 @@ def render_validation_tab(frame: pd.DataFrame, official: pd.DataFrame) -> None:
     st.caption(
         "Rates are deaths per 100,000. Differences remain visible: calibration does not establish why the source differs."
     )
-    expectancy = compare_life_expectancy(frame, official)
+    expectancy = compare_life_expectancy(frame, official, tails, config.decline_residual_fraction)
     st.markdown("**Remaining life expectancy at selected exact ages**")
     st.dataframe(
         expectancy.rename(
             columns={
                 "age": "Starting age",
                 "official_remaining_years": "Official years",
-                "uncalibrated_flat": "Source + flat 95+",
+                "uncalibrated_flat": "Source + flat after 94",
                 "uncalibrated_kannisto": "Source + Kannisto",
                 "calibrated_kannisto": "Calibrated + Kannisto",
                 "calibrated_difference": "Difference (years)",
+                "calibrated_individual": "Calibrated + individual tails",
+                "individual_difference": "Individual-tail difference (years)",
             }
         ),
         hide_index=True,
     )
     st.caption(
         "Official life expectancy is published to 0.1 years. Mx is interpreted as a constant hazard within each year. "
-        "The 95+ rate is an open-group average; Kannisto is fitted to ages 80–94 and extrapolated beyond 94."
+        "All 95+ observations are excluded. Kannisto is fitted to ages 80–94 and extrapolated beyond 94."
     )
     fit = MortalityModel(frame, official_life_table=official).old_age_fit(ProjectionConfig())
     with st.expander("Old-age fit and limitations"):
@@ -691,7 +893,8 @@ def render_validation_tab(frame: pd.DataFrame, official: pd.DataFrame) -> None:
         st.markdown(
             "The fit uses least squares on logit mortality, an asymptote of 1/year, and an anchor at age 94. "
             "It is inspired by the [HMD methodology](https://www.mortality.org/File/GetDocument/Public/Docs/MethodsProtocolV6.pdf), "
-            "but does not reproduce its exposure-weighted estimation. Cause shares are fixed after 95. "
+            "but does not reproduce its exposure-weighted estimation. This is the legacy common-curve comparator; "
+            "individual mode fits separate tails and allows cause shares to change. "
             "Interventions can reduce the old-age hazard, so extreme scenarios can still have very long lifespans."
         )
     st.download_button(
@@ -700,3 +903,125 @@ def render_validation_tab(frame: pd.DataFrame, official: pd.DataFrame) -> None:
         "reference_comparison.csv",
         "text/csv",
     )
+
+
+def render_trajectories_tab(
+    raw: pd.DataFrame,
+    frame: pd.DataFrame,
+    official: pd.DataFrame,
+    tails: dict[str, CauseTailFit],
+    config: ProjectionConfig,
+) -> None:
+    st.subheader("Individual late-age trajectories")
+    st.caption(
+        "Shapes use 2011–2019; levels use 2021. Exponent, sigmoid, plateau and decline "
+        "are spliced continuously at age 94. Dementia defaults to an exponent fitted at 70–89; "
+        "its 70–94 sigmoid is a comparison. All 95+ observations are excluded."
+    )
+    names = cause_names_by_code(frame)
+    table = tail_fit_table(tails, names)
+    counts = table.Family.value_counts()
+    st.write(
+        " · ".join(
+            f"{kind.title()}: {counts.get(kind, 0)}"
+            for kind in ("exponent", "sigmoid", "plateau", "decline")
+        )
+    )
+    st.dataframe(table.drop(columns=["Reason"]), hide_index=True)
+    st.download_button(
+        "Download cause trajectory fits CSV",
+        table.to_csv(index=False),
+        "cause_trajectory_fits.csv",
+        "text/csv",
+    )
+    options = cause_options(frame)
+    ordered_names = sorted(options)
+    cause_name = st.selectbox(
+        "Inspect a cause trajectory",
+        ordered_names,
+        index=ordered_names.index(DEMENTIA_NAME) if DEMENTIA_NAME in options else 0,
+    )
+    code = options[cause_name]
+    fit = tails[code]
+    st.info(f"{fit.status}: {fit.reason}")
+    left, right = st.columns(2)
+    horizon = left.slider("Trajectory display end age", 100, 300, 140, 10)
+    logarithmic = right.checkbox("Logarithmic mortality scale", value=True)
+    model = MortalityModel(frame, official_life_table=official, tail_fits=tails)
+    settings = ProjectionConfig(
+        calibrate=False,
+        trend_horizon_years=0,
+        pandemic=PandemicConfig(mode="hold_2021"),
+        decline_residual_fraction=config.decline_residual_fraction,
+    )
+    ages = np.arange(70, horizon + 1)
+    rates = model.rates(ages, np.full(len(ages), 2021), settings)[:, model.codes.index(code)]
+    source = frame[(frame.cause_code == code) & frame.age_start.between(70, 90)]
+    history = merge_dementia(raw[raw.age_start < 95])
+    history = history[(history.cause_code == code) & history.year.between(2011, 2019)]
+    means = history[history.age_start.between(70, 90)].groupby("age_mid").rate.mean()
+    figure = go.Figure()
+    figure.add_scatter(
+        x=source.age_mid,
+        y=source.rate,
+        mode="markers",
+        name="2021 closed age groups",
+        marker={"size": 9, "color": "#0f766e"},
+    )
+    if not means.empty:
+        figure.add_scatter(
+            x=means.index,
+            y=means.values,
+            mode="lines+markers",
+            name="2011–2019 mean rates",
+            line={"color": "#94a3b8", "dash": "dot"},
+        )
+    for mask, label, dash in [
+        (ages <= 94, "2021 interpolation", "solid"),
+        (ages >= 94, f"Selected tail: {fit.curve.kind}", "dash"),
+    ]:
+        figure.add_scatter(x=ages[mask], y=rates[mask], name=label, line={"dash": dash})
+    if fit.alternative_curve is not None:
+        tail_ages = ages[ages >= 94]
+        anchor_rate = rates[ages == 94][0]
+        alternative_rates = anchor_rate * np.exp(
+            fit.alternative_curve.log_multiplier(
+                tail_ages - 94, decline_residual=config.decline_residual_fraction
+            )
+        )
+        figure.add_scatter(
+            x=tail_ages,
+            y=alternative_rates,
+            name=f"Comparison: {fit.alternative_curve.kind} ({fit.alternative_fit_ages})",
+            line={"dash": "dot", "color": "#d97706"},
+        )
+    figure.add_vline(x=94, line_dash="dot", line_color="#94a3b8")
+    figure.update_layout(
+        template="plotly_white",
+        height=520,
+        margin={"t": 25, "b": 120},
+        xaxis_title="Attained age",
+        yaxis_title="Mortality rate per 100,000 per year",
+        yaxis_type="log" if logarithmic else "linear",
+        legend={"orientation": "h", "y": -0.25, "yanchor": "top", "x": 0},
+    )
+    st.plotly_chart(figure, width="stretch")
+    st.caption(
+        "All 95+ observations are excluded from fitting, calibration and historical trends. "
+        "This chart holds 2021 levels and COVID fixed, disables calendar trends and interventions, "
+        "and shows uncalibrated cause rates so they can be compared with the observations. "
+        f"Declining tails retain the selected residual share: {config.decline_residual_fraction:.0%}."
+    )
+    with st.expander("How the first-version selection works"):
+        st.markdown(
+            "Positive, sufficiently large series are compared by predicting the next closed age group: "
+            "70–84 → 85–89, then 70–89 → 90–94, separately for 2011–2019. "
+            "Scores are mean year-wise log-RMSE, not confidence intervals. Near ties favour simpler forms. "
+            "Sigmoid selection requires a material improvement and support in at least two thirds of years. "
+            "A repeated decline from 85–89 to 90–94 uses that terminal branch; it has no independent "
+            "older closed group for validation. Rare/zero series and COVID receive explicit plateau fallbacks. "
+            "Dementia is an explicit exception: its default exponent uses 70–89, with no selection score; "
+            "a sigmoid using 70–94 remains available as a comparison. "
+            "No death counts or exposures are available, so these are descriptive fits. "
+            "Neither sigmoid saturation levels nor centuries-long extrapolations are empirically validated."
+        )
