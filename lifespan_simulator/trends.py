@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .config import COVID_CODES
+
 T_CRITICAL_95 = {
     1: 12.706,
     2: 4.303,
@@ -44,18 +46,7 @@ T_CRITICAL_95 = {
 
 @dataclass(frozen=True)
 class TrendModel:
-    """Significant linear mortality trends used by the simulator.
-
-    Attributes:
-        slope_table: Nested lookup keyed first by ``age_start`` and then by
-            ``cause_code``. Values are annual mortality-rate slopes per 100,000
-            population. Non-significant trends are stored as ``0.0`` so the
-            simulator can use one simple lookup for every cause-age pair.
-        significant_count: Number of cause-age regressions whose 95% slope
-            confidence interval excludes zero.
-        total_count: Number of cause-age regressions fitted for the simulator's
-            non-overlapping cause set.
-    """
+    """Significant linear mortality trends used by the simulator."""
 
     slope_table: dict[int, dict[str, float]]
     significant_count: int
@@ -63,23 +54,7 @@ class TrendModel:
 
 
 def build_trend_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Fit a linear mortality-rate trend and regression summary statistics.
-
-    Args:
-        frame: Mortality DataFrame for one selected cause and one selected age
-            group. It is sliced in ``app.render_explorer_tab`` from the complete
-            normalized mortality dataset and must include ``year`` and ``rate``
-            columns.
-
-    Returns:
-        A pair containing the ordered trend DataFrame and a statistics mapping.
-        The DataFrame preserves the input rows sorted by year and adds
-        ``trend``, ``trend_lower``, and ``trend_upper`` columns for the fitted
-        mean line and its 95% confidence interval. The stats mapping contains
-        ``slope``, ``intercept``, ``r_squared``, ``slope_ci_lower``,
-        ``slope_ci_upper``, and ``slope_significant``. ``slope_significant`` is
-        true when the 95% confidence interval for the slope excludes zero.
-    """
+    """Fit a linear mortality-rate trend and regression summary statistics."""
     ordered = frame.sort_values("year").copy()
     x = ordered["year"].to_numpy(dtype=float)
     y = ordered["rate"].to_numpy(dtype=float)
@@ -98,7 +73,7 @@ def build_trend_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]
             "slope_significant": False,
         }
 
-    design = np.column_stack([np.ones_like(x), x])
+    design = np.column_stack([np.ones_like(x), x - x.mean()])
     coefficients, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
     fitted = design @ coefficients
     residuals = y - fitted
@@ -138,40 +113,33 @@ def build_trend_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]
 
     return ordered, {
         "slope": slope,
-        "intercept": float(coefficients[0]),
+        "intercept": float(coefficients[0] - coefficients[1] * x_mean),
         "r_squared": r_squared,
         "slope_ci_lower": float(slope_ci_lower),
         "slope_ci_upper": float(slope_ci_upper),
-        "slope_significant": bool(slope_ci_lower > 0 or slope_ci_upper < 0),
+        "slope_significant": bool(
+            not np.isclose(slope, 0.0, atol=1e-12) and (slope_ci_lower > 0 or slope_ci_upper < 0)
+        ),
     }
 
 
-def build_trend_model(raw_frame: pd.DataFrame, simulator_frame: pd.DataFrame) -> TrendModel:
-    """Build significant cause-age trend slopes for survival simulation.
-
-    Args:
-        raw_frame: Complete normalized mortality dataset returned by
-            ``load_mortality_data``. It contains all available years, including
-            the 2011-2021 history used to fit each linear trend.
-        simulator_frame: 2021 non-overlapping simulator DataFrame returned by
-            ``get_simulator_frame``. It defines the exact age buckets and cause
-            codes that can contribute to survival totals without double-counting
-            aggregate categories.
-
-    Returns:
-        :class:`TrendModel` containing one slope entry for every simulator
-        age-bucket and cause-code pair. A slope is retained only when the
-        corresponding 95% confidence interval excludes zero; otherwise the
-        stored slope is ``0.0``.
-    """
+def build_trend_model(
+    raw_frame: pd.DataFrame, simulator_frame: pd.DataFrame, end_year: int = 2019
+) -> TrendModel:
+    """Build significant cause-age trend slopes for survival simulation."""
     simulator_keys = simulator_frame[["age_start", "cause_code"]].drop_duplicates()
-    trend_source = raw_frame.merge(simulator_keys, on=["age_start", "cause_code"], how="inner")
+    # Pandemic years can be explored in the UI but are excluded from the default
+    # secular trend fit. COVID itself always follows a separate scenario path.
+    history = raw_frame[(raw_frame.year <= end_year) & ~raw_frame.cause_code.isin(COVID_CODES)]
+    trend_source = history.merge(simulator_keys, on=["age_start", "cause_code"], how="inner")
 
     slope_table: dict[int, dict[str, float]] = {}
     significant_count = 0
     total_count = 0
 
-    for (age_start, cause_code), group in trend_source.groupby(["age_start", "cause_code"], sort=True):
+    for (age_start, cause_code), group in trend_source.groupby(
+        ["age_start", "cause_code"], sort=True
+    ):
         _, stats = build_trend_frame(group)
         total_count += 1
 
