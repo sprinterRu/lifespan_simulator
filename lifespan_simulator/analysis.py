@@ -119,7 +119,7 @@ def sensitivity_variants(
         for floor in (0.001, 0.05):
             changed = {code: value._replace(floor=floor) for code, value in scenarios.items()}
             variants.append(
-                (f"Interventions: residual {floor:.1%}", config, build_scenario_map(changed))
+                (f"Interventions: slow floor {floor:.1%}", config, build_scenario_map(changed))
             )
     return variants
 
@@ -148,7 +148,15 @@ def run_sensitivity(
                 "Expected years before horizon": result.restricted_remaining_life_expectancy,
                 "Alive at horizon (%)": 100 * result.survival_at_end,
                 "Unintegrated years upper bound": result.remaining_expectation_bound,
-                "Mean resolved": result.converged,
+                "Limiting survival: lower bound (%)": 100 * result.survival_forever_lower_bound
+                if result.survival_forever_lower_bound is not None
+                else np.nan,
+                "Mean status": "Infinite"
+                if result.infinite_mean
+                else "Resolved"
+                if result.converged
+                else "Unresolved",
+                "Mean resolved": result.mean_resolved,
             }
         )
     return pd.DataFrame(rows)

@@ -45,5 +45,8 @@ def constant_model():
 @pytest.fixture
 def fixed_config():
     return ProjectionConfig(
-        calibrate=False, old_age_model="flat", pandemic=PandemicConfig(mode="hold_2021")
+        calibrate=False,
+        old_age_model="flat",
+        pandemic=PandemicConfig(mode="hold_2021"),
+        max_age=200,
     )

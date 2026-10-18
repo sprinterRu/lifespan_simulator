@@ -1,19 +1,19 @@
 """Integrate a cohort's survival under piecewise-constant annual hazards.
 
 Projection is bounded in work, not by an assumed maximum human lifespan. If
-survivors beyond the numerical horizon can materially change the mean, report
-only the restricted mean and mark full life expectancy as unresolved.
+survivors beyond the numerical horizon can materially change a finite mean,
+mark it unresolved. Report infinity when the future hazard structure proves it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, expm1, log
+from math import exp, expm1, inf, isfinite, log
 
 import numpy as np
 import pandas as pd
 
-from .config import BASE_YEAR, RATE_SCALE, ProjectionConfig
+from .config import BASE_YEAR, MAX_INTEGRATION_END_AGE, RATE_SCALE, ProjectionConfig
 from .interventions import ScenarioMap, build_scenario_map
 from .mortality import MortalityModel
 
@@ -32,10 +32,21 @@ class SimulationResult:
     life_expectancy_age: float | None
     remaining_expectation_bound: float
     percentiles: dict[str, float | None]
+    survival_forever_lower_bound: float | None
 
     @property
     def converged(self) -> bool:
+        return self.remaining_life_expectancy is not None and isfinite(
+            self.remaining_life_expectancy
+        )
+
+    @property
+    def mean_resolved(self) -> bool:
         return self.remaining_life_expectancy is not None
+
+    @property
+    def infinite_mean(self) -> bool:
+        return self.remaining_life_expectancy == inf
 
 
 def project_cause_rates(
@@ -86,8 +97,10 @@ def _age_year_grid(
 ) -> tuple[np.ndarray, np.ndarray]:
     if not isinstance(initial_age, int) or not model.minimum_age <= initial_age <= 95:
         raise ValueError(f"Initial age must be an integer between {model.minimum_age} and 95")
-    if not initial_age <= end_age <= 500:
-        raise ValueError("Projection end age must lie between the initial age and 500")
+    if not initial_age <= end_age <= MAX_INTEGRATION_END_AGE:
+        raise ValueError(
+            f"Projection end age must lie between the initial age and {MAX_INTEGRATION_END_AGE}"
+        )
     ages = np.arange(initial_age, end_age + 1)
     return ages, config.start_year + ages - initial_age
 
@@ -101,7 +114,10 @@ def simulate_survival(
     config = config or ProjectionConfig()
     scenarios = build_scenario_map(scenario_map or {})
     ages, years = _age_year_grid(model, initial_age, config.max_age, config)
-    hazards = model.rates(ages, years, config, scenarios).sum(axis=1) / RATE_SCALE
+    # Gompertz hazards can exceed floating-point range at remote ages. Infinite
+    # hazards have a well-defined zero-survival limit, unlike NaN values.
+    with np.errstate(over="ignore"):
+        hazards = model.rates(ages, years, config, scenarios).sum(axis=1) / RATE_SCALE
     survival = 1.0
     expectation = 0.0
     rows = []
@@ -129,11 +145,18 @@ def simulate_survival(
         )
         survival = next_survival
 
-    lower_hazard = model.future_hazard_lower_bound(
-        config.max_age, int(years[-1]), config, scenarios
-    )
-    remainder_bound = survival / lower_hazard if lower_hazard > 0 else float("inf")
+    future = model.future_mortality(config.max_age, int(years[-1]), config, scenarios)
+    remainder_bound = survival / future.minimum_hazard if future.minimum_hazard > 0 else inf
     converged = remainder_bound <= config.expectation_tolerance
+    remaining_mean = inf if future.infinite_mean else expectation if converged else None
+    survival_forever = None
+    if future.infinite_mean:
+        with np.errstate(over="ignore"):
+            log_survival_floor = -float(hazards[:-1].sum()) - future.remaining_hazard_upper_bound
+        survival_forever = exp(log_survival_floor)
+        for label, fraction in PERCENTILES.items():
+            if percentiles[label] is None and log(1 - fraction) <= log_survival_floor:
+                percentiles[label] = inf
     annual = pd.DataFrame(rows)
     curve = _survival_curve(annual)
     return SimulationResult(
@@ -142,10 +165,11 @@ def simulate_survival(
         integration_end_age=config.max_age,
         survival_at_end=survival,
         restricted_remaining_life_expectancy=expectation,
-        remaining_life_expectancy=expectation if converged else None,
-        life_expectancy_age=initial_age + expectation if converged else None,
+        remaining_life_expectancy=remaining_mean,
+        life_expectancy_age=initial_age + remaining_mean if remaining_mean is not None else None,
         remaining_expectation_bound=remainder_bound,
         percentiles=percentiles,
+        survival_forever_lower_bound=survival_forever,
     )
 
 
@@ -153,9 +177,11 @@ def _survival_curve(annual: pd.DataFrame) -> pd.DataFrame:
     """Sample the within-year exponential, keeping the entire numerical horizon."""
     fractions = np.array([0.0, 0.25, 0.50, 0.75])
     ages = annual.age_start.to_numpy()[:, None] + fractions
-    survival = annual.survival_start.to_numpy()[:, None] * np.exp(
-        -annual.hazard.to_numpy()[:, None] * fractions
-    )
+    # At the start of an interval the exponent is zero, even if its hazard is
+    # beyond floating-point range; avoid the undefined product inf * 0.
+    exponents = np.zeros(ages.shape)
+    np.multiply(annual.hazard.to_numpy()[:, None], fractions, out=exponents, where=fractions > 0)
+    survival = annual.survival_start.to_numpy()[:, None] * np.exp(-exponents)
     return pd.DataFrame(
         {
             "age": np.append(ages.ravel(), annual.age_end.iloc[-1]),

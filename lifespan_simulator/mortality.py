@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
 
 from .config import BASE_YEAR, COVID_CODES, RATE_SCALE, PandemicConfig, ProjectionConfig
-from .interventions import ScenarioMap, intervention_multiplier, limiting_intervention_multiplier
+from .interventions import ScenarioMap, log_intervention_multiplier
 
 TrendTable = dict[int, dict[str, float]]
+
+
+@dataclass(frozen=True)
+class FutureMortality:
+    minimum_hazard: float
+    infinite_mean: bool
+    remaining_hazard_upper_bound: float = float("inf")
+
+
+def _log_nonnegative(values: np.ndarray | float) -> np.ndarray:
+    """Represent zero rates/multipliers as -inf without logarithm warnings."""
+    values = np.asarray(values, dtype=float)
+    return np.log(values, out=np.full_like(values, -np.inf), where=values > 0)
 
 
 class MortalityModel:
@@ -115,7 +128,12 @@ class MortalityModel:
         }
 
     def baseline_total(self, ages: np.ndarray, config: ProjectionConfig) -> np.ndarray:
-        totals = self._observed_total(np.minimum(ages, 94), config.calibrate)
+        with np.errstate(over="ignore"):
+            return np.exp(self._log_baseline_hazard(ages, config)) * RATE_SCALE
+
+    def _log_baseline_hazard(self, ages: np.ndarray, config: ProjectionConfig) -> np.ndarray:
+        """Keep exponential ageing finite until all risk multipliers are combined."""
+        totals = np.log(self._observed_total(np.minimum(ages, 94), config.calibrate) / RATE_SCALE)
         beyond = ages > 94
         if not beyond.any():
             return totals
@@ -125,17 +143,17 @@ class MortalityModel:
                 if config.calibrate
                 else self._raw_rates(np.array([95])).sum()
             )
-            totals[beyond] = terminal
+            totals[beyond] = np.log(terminal / RATE_SCALE)
             return totals
         fit = self.old_age_fit(config)
         years = ages[beyond] - 94
         anchor = fit["anchor_hazard"]
         slope = fit[config.old_age_model + "_slope"] * config.old_age_slope_multiplier
         if config.old_age_model == "kannisto":
-            hazards = 1 / (1 + (1 / anchor - 1) * np.exp(-slope * years))
+            log_hazards = -np.logaddexp(0, np.log(1 / anchor - 1) - slope * years)
         else:
-            hazards = anchor * np.exp(slope * years)
-        totals[beyond] = hazards * RATE_SCALE
+            log_hazards = np.log(anchor) + slope * years
+        totals[beyond] = log_hazards
         return totals
 
     def rates(
@@ -146,53 +164,131 @@ class MortalityModel:
         scenarios: ScenarioMap | None = None,
     ) -> np.ndarray:
         """Resolve all causes together; return rates per 100,000, not probabilities."""
+        with np.errstate(over="ignore"):
+            return np.exp(self._log_rates(ages, years, config, scenarios))
+
+    def _log_rates(
+        self,
+        ages: np.ndarray,
+        years: np.ndarray,
+        config: ProjectionConfig,
+        scenarios: ScenarioMap | None = None,
+    ) -> np.ndarray:
         ages, years = np.asarray(ages), np.asarray(years)
         raw = self._raw_rates(ages)
         total = raw.sum(axis=1)
         if (total <= 0).any():
             raise ValueError("Cause totals must be positive at every projected age")
-        scale = self.baseline_total(ages, config) / total
+        log_scale = self._log_baseline_hazard(ages, config) - np.log(total / RATE_SCALE)
         elapsed = np.clip(years - BASE_YEAR, 0, config.trend_horizon_years)
         projected = raw + self._trend_slopes(ages) * elapsed[:, None]
         projected = np.maximum(raw * config.trend_floor, projected)
         # A zero observed cause rate does not impose a zero ceiling on new risk.
         projected = np.minimum(np.where(raw > 0, raw * config.trend_ceiling, np.inf), projected)
-        projected *= scale[:, None]
+        log_rates = _log_nonnegative(projected) + log_scale[:, None]
         pandemic = config.pandemic
         if pandemic.mode == "exclude":
-            covid_multiplier = np.zeros(len(years))
+            log_covid_multiplier = np.full(len(years), -np.inf)
         elif pandemic.mode == "hold_2021":
-            covid_multiplier = np.ones(len(years))
+            log_covid_multiplier = np.zeros(len(years))
         else:
-            covid_multiplier = pandemic.residual_fraction + (
-                1 - pandemic.residual_fraction
-            ) * np.exp2(-np.maximum(0, years - BASE_YEAR) / pandemic.half_life_years)
-        projected[:, self.covid_mask] *= covid_multiplier[:, None]
+            log_decay = -np.log(2) * np.maximum(0, years - BASE_YEAR) / pandemic.half_life_years
+            log_residual, log_fading_share = _log_nonnegative(
+                np.array([pandemic.residual_fraction, 1 - pandemic.residual_fraction])
+            )
+            log_covid_multiplier = np.logaddexp(log_residual, log_fading_share + log_decay)
+        log_rates[:, self.covid_mask] += log_covid_multiplier[:, None]
         for code, intervention in (scenarios or {}).items():
             if code not in self.codes:
                 raise ValueError(f"Unknown intervention cause: {code}")
-            projected[:, self.codes.index(code)] *= intervention_multiplier(years, intervention)
-        return projected
+            log_rates[:, self.codes.index(code)] += log_intervention_multiplier(years, intervention)
+        return log_rates
 
     def future_hazard_lower_bound(
         self, age: int, year: int, config: ProjectionConfig, scenarios: ScenarioMap
     ) -> float:
-        """Conservative future hazard bound after shares/slopes stop changing with age.
+        return self.future_mortality(age, year, config, scenarios).minimum_hazard
 
-        Old-age totals are non-decreasing. Each time trend is monotone until its
-        fixed horizon, and intervention/COVID multipliers cannot fall below their
-        configured floors. Thus S(age)/bound limits the unintegrated life-years.
+    def future_mortality(
+        self, age: int, year: int, config: ProjectionConfig, scenarios: ScenarioMap
+    ) -> FutureMortality:
+        """Bound the tail after trends and intervention stage transitions finish.
+
+        A cause then follows a geometric annual multiplier, times either a
+        constant, a bounded Kannisto hazard, or exponential Gompertz ageing.
+        Every remaining term decaying geometrically implies finite cumulative
+        future hazard, positive limiting survival, and an infinite full mean.
+        Non-decaying terms instead provide a positive future hazard bound.
         """
         if age < 95:
             raise ValueError("Tail bound requires age at least 95")
-        fixed_pandemic = replace(config, pandemic=PandemicConfig(mode="hold_2021"))
-        rates = self.rates(
-            np.array([age, age]),
-            np.array([year, max(year, BASE_YEAR + config.trend_horizon_years)]),
-            fixed_pandemic,
+        anchor_year = max(
+            year,
+            BASE_YEAR + config.trend_horizon_years,
+            max((value.fast_start_year for value in scenarios.values()), default=year),
         )
-        lower = rates.min(axis=0)
-        lower[self.covid_mask] *= config.pandemic.limiting_multiplier
+        anchor_age = age + anchor_year - year
+        fixed_pandemic = replace(config, pandemic=PandemicConfig(mode="hold_2021"))
+        log_rates = self._log_rates(
+            np.array([anchor_age]),
+            np.array([anchor_year]),
+            fixed_pandemic,
+            scenarios,
+        )[0] - np.log(RATE_SCALE)
+        ageing_growth = (
+            self.old_age_fit(config)["gompertz_slope"] * config.old_age_slope_multiplier
+            if config.old_age_model == "gompertz"
+            else 0.0
+        )
+        growth = np.full(len(self.codes), ageing_growth)
         for code, intervention in scenarios.items():
-            lower[self.codes.index(code)] *= limiting_intervention_multiplier(intervention)
-        return float(lower.sum() / RATE_SCALE)
+            growth[self.codes.index(code)] += (
+                np.log1p(-intervention.fast_rate) if intervention.fast_rate < 1 else -np.inf
+            )
+
+        # A fading COVID rate is the sum of a residual and a decaying term.
+        log_terms, term_growth = [], []
+        for index, log_rate in enumerate(log_rates):
+            if not np.isfinite(log_rate):
+                continue
+            if not self.covid_mask[index] or config.pandemic.mode == "hold_2021":
+                log_terms.append(log_rate)
+                term_growth.append(growth[index])
+            elif config.pandemic.mode == "fade":
+                residual = config.pandemic.residual_fraction
+                decay = -np.log(2) / config.pandemic.half_life_years
+                if residual > 0:
+                    log_terms.append(log_rate + np.log(residual))
+                    term_growth.append(growth[index])
+                if residual < 1:
+                    log_terms.append(
+                        log_rate + np.log1p(-residual) + decay * (anchor_year - BASE_YEAR)
+                    )
+                    term_growth.append(growth[index] + decay)
+        log_terms, term_growth = np.array(log_terms), np.array(term_growth)
+
+        prefix_min, prefix_sum = float("inf"), 0.0
+        if anchor_age > age:
+            prefix_ages = np.arange(age, anchor_age)
+            with np.errstate(over="ignore"):
+                prefix = (
+                    self.rates(prefix_ages, year + prefix_ages - age, config, scenarios).sum(axis=1)
+                    / RATE_SCALE
+                )
+                prefix_min, prefix_sum = float(prefix.min()), float(prefix.sum())
+        non_decaying = term_growth >= 0
+        with np.errstate(over="ignore"):
+            if non_decaying.any():
+                lower = float(np.exp(np.logaddexp.reduce(log_terms[non_decaying])))
+                return FutureMortality(min(prefix_min, lower), infinite_mean=False)
+
+            if not len(log_terms):
+                return FutureMortality(
+                    0.0, infinite_mean=True, remaining_hazard_upper_bound=prefix_sum
+                )
+            if config.old_age_model == "kannisto":
+                # Its asymptote is 1/year: bound future ageing by 1/h(anchor).
+                log_terms -= self._log_baseline_hazard(np.array([anchor_age]), config)[0]
+            log_sums = log_terms - np.log(-np.expm1(term_growth))
+            upper = prefix_sum + float(np.exp(np.logaddexp.reduce(log_sums)))
+            return FutureMortality(0.0, infinite_mean=True, remaining_hazard_upper_bound=upper)

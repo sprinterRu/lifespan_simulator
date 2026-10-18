@@ -12,6 +12,7 @@ from lifespan_simulator.analysis import (
 )
 from lifespan_simulator.config import PandemicConfig, ProjectionConfig
 from lifespan_simulator.data import REFERENCE_DIR, load_official_cause_totals
+from lifespan_simulator.interventions import build_scenario_map
 from lifespan_simulator.mortality import MortalityModel
 from lifespan_simulator.simulation import simulate_survival
 from lifespan_simulator.trends import build_trend_model
@@ -77,6 +78,49 @@ def test_covid_has_separate_path_and_non_covid_is_unchanged(model):
         a[:, model.covid_mask].sum(axis=1) / b[:, model.covid_mask].sum(axis=1),
         [0.1 + 0.9 * 2 ** (-t / 3) for t in (0, 3, 30)],
     )
+
+
+def test_remote_age_combines_overflowing_baseline_and_underflowing_decay(inputs):
+    _, frame, official = inputs
+    model = MortalityModel(frame, official_life_table=official)
+    config = ProjectionConfig(
+        max_age=10_000,
+        old_age_model="gompertz",
+        old_age_slope_multiplier=2,
+        pandemic=PandemicConfig(residual_fraction=0),
+    )
+    fit = model.old_age_fit(config)
+    source = frame[frame.age_start == 95].set_index("cause_code").rate
+    log_hazard = np.log(fit["anchor_hazard"]) + 2 * fit["gompertz_slope"] * (10_000 - 94)
+    log_decay = -np.log(2) * (11_986 - 2021) / 3
+    assert log_hazard > 710 and log_decay < -745
+    expected = np.exp(log_hazard + np.log(100_000 * source["U071"] / source.sum()) + log_decay)
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        actual = model.rates(np.array([10_000]), np.array([11_986]), config)[
+            0, model.codes.index("U071")
+        ]
+    assert np.isfinite(actual) and actual > 0
+    assert actual == pytest.approx(expected)
+
+
+def test_remote_age_preserves_fast_multiplier_before_exponentiation(inputs):
+    _, frame, official = inputs
+    model = MortalityModel(frame, official_life_table=official)
+    config = ProjectionConfig(old_age_model="gompertz", old_age_slope_multiplier=2)
+    scenarios = build_scenario_map({"C33_C34": (2021, 0, 2021, 0.2, 0.5)})
+    fit = model.old_age_fit(config)
+    source = frame[frame.age_start == 95].set_index("cause_code").rate
+    log_hazard = np.log(fit["anchor_hazard"]) + 2 * fit["gompertz_slope"] * (10_000 - 94)
+    log_reduction = np.log(0.8) * (11_986 - 2021 + 1)
+    assert log_hazard > 710 and log_reduction < -745
+    expected = np.exp(
+        log_hazard + np.log(100_000 * source["C33_C34"] / source.sum()) + log_reduction
+    )
+    actual = model.rates(np.array([10_000]), np.array([11_986]), config, scenarios)[
+        0, model.codes.index("C33_C34")
+    ]
+    assert np.isfinite(actual) and actual > 0
+    assert actual == pytest.approx(expected)
 
 
 def test_pre_pandemic_trends_do_not_learn_from_future_years(inputs):

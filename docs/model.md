@@ -53,9 +53,16 @@ The default half-life of 3 years and residual 10% are illustrative, not estimate
 
 ## Interventions
 
-The existing two-stage fractional annual reduction is preserved. A reduction is applied in its stated first year. At the fast-stage boundary the slow-stage accumulated multiplier is retained, then fast reductions begin. Multipliers never drop below the configured intervention floor. A zero fast rate leaves the accumulated slow-stage effect unchanged.
+The two-stage fractional annual reduction applies its first reduction in the stated start year. The floor limits only the slow-stage multiplier. At the fast boundary the accumulated slow multiplier is retained, then fast reductions compound without a floor:
 
-Evaluation uses `log1p(-rate)` and a separate branch for a 100% annual reduction. It does not iterate until a floor is reached. All stages act on top of the chosen counterfactual; an intervention should represent progress additional to any historical extrapolation.
+```text
+multiplier = max(slow_floor, (1 - slow_rate) ** slow_years)
+             * (1 - fast_rate) ** fast_years
+```
+
+`slow_years` stops accumulating just before fast begins. A zero fast rate preserves that slow multiplier; a 100% fast reduction makes the cause's hazard exactly zero from the fast start year. The default fast rate remains 10% annually, leaving `0.9 ** 10 ≈ 0.349` after ten fast reductions, on top of the slow effect. CSV column `Floor` now means slow floor; its name is retained for compatibility.
+
+Evaluation uses `log1p(-rate)` and a separate branch for a 100% annual reduction. The mortality calculation retains the log multiplier through its combination with ageing, avoiding premature underflow of tiny fast multipliers. All stages act on top of the chosen counterfactual; an intervention should represent progress additional to any historical extrapolation.
 
 Interventions are still uniform by age, without treatment uptake, adherence, disease states or correlated individual frailty. Changes in one cause do not directly modify another cause's hazard. Competing deaths nevertheless remain coupled through total survival.
 
@@ -68,21 +75,29 @@ S(a + 1) = S(a) × exp(-h)
 life-years in interval = S(a) × (1 - exp(-h)) / h
 ```
 
-For `h=0`, the contribution is `S(a)`. `expm1` provides stable integration when hazards are tiny. Percentile crossing times use the inverse exponential within the year. The plotted curve samples these exponentials quarterly and displays the whole numerical horizon.
+For `h=0`, the contribution is `S(a)`. `expm1` provides stable integration when hazards are tiny. Percentile crossing times use the inverse exponential within the year. The plotted curve samples these exponentials quarterly and retains the whole numerical horizon. Its initial zoom covers at least 99% of deaths when that percentile is reached; a range slider exposes the rest of the horizon.
 
-The integration ends at a configurable age `H` (default 200, allowed maximum 500). This bounds computation; it is not a maximum age at death. We retain:
+The integration ends at a configurable age `H` (default 2,000, allowed range 100–10,000). This supports radical life-extension scenarios while bounding computation; it is not a maximum age at death. We retain:
 
 - the restricted expected remaining years before `H`;
 - survival `S(H)`;
 - percentiles reached before `H`;
 - an upper bound on the remaining expected life-years.
 
-For ages at least 95, source cause shares/slopes are fixed and baseline old-age totals are non-decreasing. A conservative future lower hazard `h_min` is constructed from the smaller endpoint of each bounded time trend, the limiting COVID multiplier, and each intervention's limiting multiplier. Consequently:
+Old-age hazards, cause scaling, COVID decay and intervention effects are combined in logarithms before exponentiation. This avoids overflowing a Gompertz baseline before a small multiplier is applied, or forming `inf * 0` for excluded causes. A final hazard beyond floating-point range is represented as infinity and integrated using its zero-survival, zero-life-years limit; no artificial maximum hazard is imposed. Survival at the exact start of such an interval is retained explicitly. These numerical protections do not make extrapolations to remote ages empirically validated.
+
+For ages at least 95, cause shares/slopes are fixed. Tail analysis first advances to an anchor after time trends and all fast-stage transitions have finished, explicitly checking any intervening annual hazards. Thereafter each nonzero cause is a geometric sequence multiplied by the age curve. COVID fade is split into residual and decaying components.
+
+For flat/Kannisto ageing the geometric log-growth is `log(1 - fast_rate)`, with an additional `-log(2)/half_life` for a fading COVID component. Gompertz adds its positive ageing slope. Non-decaying components provide a conservative positive future hazard bound `h_min`, combined with the minimum across any years before the anchor. Thus:
 
 ```text
 remaining integral <= S(H) / h_min
 ```
 
-This bound requires no frozen tail assumption. A positive bound on future hazard bounds the future survival by an exponential; it does not assert that future survival follows that exponential. With no positive lower hazard, the remainder is treated as unbounded. A full mean is reported only when the omitted contribution is at most 0.001 years. Otherwise it is `None` / “Unresolved”; the restricted mean remains available.
+This bound requires no frozen tail assumption. A finite mean is reported only when the omitted contribution is at most 0.001 years; otherwise it remains `None` / “Unresolved”.
+
+If every remaining component decays geometrically, or all have been eliminated, total future cumulative hazard is finite. Survival then has a positive limit and the full mean is analytically **infinite**, regardless of the integration horizon. This classification also accounts for Gompertz growth: fast improvements need to outpace ageing for all surviving terms. Zero numerical hazard at a distant age alone is not used as proof.
+
+For a decreasing term `h(n) = c * exp(g*n)`, the cumulative hazard is `c / (1 - exp(g))`. Flat and Gompertz tails use this geometric sum directly; Kannisto uses its 1/year asymptote to bound future ageing from above. Adding the pre-anchor hazard gives a conservative remaining cumulative-hazard bound `U`. Then `S(infinity) >= S(H) * exp(-U)`. Percentiles are marked infinite only when this lower survival bound proves they cannot be reached. A bound can underflow to zero while the structural proof of an infinite mean remains valid. Restricted life-years remain finite and comparable at a common horizon in all cases.
 
 Sensitivity analysis compares deterministic alternative settings, using the same settings for the paired baseline and intervention and the same horizon for restricted means. These ranges are not probability intervals. No claim is made that a narrow sensitivity range demonstrates forecast accuracy.

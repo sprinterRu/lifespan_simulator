@@ -36,8 +36,8 @@ uv run ruff format --check .
 | Historical trends | Significant linear cause-age slopes from 2011–2019; COVID excluded |
 | Trend bounds | 15% to 2× the age-specific baseline; extrapolate for 50 years after 2021, then hold time factors fixed |
 | COVID | Fade from its 2021 rate with a 3-year half-life toward a 10% residual share |
-| Intervention | Slow start 2040, reduction 1.5%/year; fast start 2080, reduction 10%/year; residual multiplier 1% |
-| Numerical horizon | Age 200, selectable up to 500; not a maximum human lifespan |
+| Intervention | Slow start 2040, reduction 1.5%/year, slow floor 1%; fast start 2080, reduction 10%/year without a floor |
+| Numerical horizon | Age 2,000, editable from 100 to 10,000; not a maximum human lifespan |
 
 COVID fade, trend bounds/horizon and intervention values are **scenario assumptions**, not estimates of medical progress. The non-COVID 2021 baseline may retain indirect pandemic effects. Interventions apply additional reductions relative to the chosen baseline; avoid counting the same progress in both the trend and the intervention.
 
@@ -45,9 +45,12 @@ COVID fade, trend bounds/horizon and intervention values are **scenario assumpti
 
 - **Mean age at death** is initial age plus expected remaining life. It is not life expectancy at birth.
 - **p75** is the age by which 75% of the modeled cohort has died. Percentiles are not confidence intervals for the forecast.
-- **Unresolved** means that surviving beyond the numerical horizon could materially affect the full mean. The app shows expected remaining years lived *before the horizon*, remaining survival and an upper bound on omitted life-years instead of inventing a constant-risk tail.
-- A resolved mean omits at most **0.001 years** under the selected model. This is numerical error control, not forecast accuracy.
-- **Beyond horizon** means a percentile was not reached within the calculation; it does not imply immortality.
+- **Unresolved** means the simulation completed, but surviving beyond the numerical horizon prevents a sufficiently precise full mean. The median can still be known because it only requires half of the cohort to have died. The app shows expected remaining years lived *before the horizon*, remaining survival, an upper bound on omitted life-years, and numerical lower/upper bounds on mean age at death. An unavailable mean has no gain indicator. Increase the horizon up to age 10,000 for longer-lived scenarios; especially small residual hazards can still leave the mean unresolved.
+- Mean-age bounds are obtained by adding the initial age to the restricted remaining years, then adding the omitted life-years bound for the upper endpoint. A blank upper mean bound means no finite bound was established, not proof of an infinite mean. These bounds describe numerical integration under the selected model, not uncertainty about future medical progress; no constant-risk tail is assumed.
+- **∞** means that the model analytically retains positive survival forever, making the full mean infinite. This can occur when fast improvements suppress every remaining mortality term indefinitely. Increasing the horizon cannot make that mean finite. Restricted life-years, reached percentiles and a lower bound on limiting survival remain available. This is a consequence of the selected assumptions, not evidence of real-world immortality.
+- A finite resolved mean omits at most **0.001 years** under the selected model. This is numerical error control, not forecast accuracy.
+- **Beyond horizon** means a percentile was not reached within the calculation. A percentile is **∞** only when the limiting-survival bound proves that it can never be reached.
+- The survival plot retains the entire computed horizon, with a range slider for exploring distant ages. Its initial view covers at least 99% of deaths if that percentile was reached, avoiding a mostly empty plot out to age 2,000.
 - Sensitivity rows are deterministic alternatives, not samples from a probability distribution or a confidence band.
 
 ## Reference data and reproducibility
@@ -76,7 +79,7 @@ See [model equations and limitations](docs/model.md) and [validation results](do
 Cause,Slow start year,Slow annual reduction,Fast start year,Fast annual reduction,Floor
 ```
 
-Values are fractions: `0.015` means 1.5% per year. The floor is a multiplier of the cause's **counterfactual rate**, after time trends and the chosen COVID path. Years must be integers in 2021–2120; fast start must not precede slow start; rates must be in [0, 1]; floor in [1e-12, 1]. Invalid and non-finite values are rejected. Active settings can be exported from the simulator.
+Values are fractions: `0.015` means 1.5% per year. The `Floor` CSV column is retained for compatibility and now limits **only the slow-stage multiplier**. The accumulated slow effect is fixed at the fast boundary; fast improvements then compound without a floor on top of it. A fast rate of `0.1` leaves 90% each year (34.9% after ten reductions); `1` eliminates this cause from the fast start year, and `0` preserves the completed slow effect. Both stages multiply the cause's counterfactual rate after time trends and the chosen COVID path. The UI calls this parameter **Slow floor**, and the assumptions JSON records its scope. Existing CSVs therefore have updated floor semantics. Years must be integers in 2021–2120; fast start must not precede slow start; rates must be in [0, 1]; slow floor in [1e-12, 1]. Invalid and non-finite values are rejected.
 
 ## Code layout
 
@@ -113,4 +116,4 @@ model = MortalityModel(frame, trend.slope_table, load_official_life_table())
 result = simulate_survival(model, initial_age=35, config=ProjectionConfig(start_year=2026))
 ```
 
-Projection functions now accept `MortalityModel` and `ProjectionConfig` instead of a raw DataFrame plus many independent options. `life_expectancy_age` and `remaining_life_expectancy` can be `None` when the full mean cannot be resolved. Use `restricted_remaining_life_expectancy`, `survival_at_end` and `remaining_expectation_bound` to inspect such cases. Export the UI's assumptions JSON alongside sensitivity CSVs to record the chosen settings.
+Projection functions accept `MortalityModel` and `ProjectionConfig`. Full mean fields are finite numbers when numerically converged, `None` when unresolved, or `math.inf` when infinity has been established analytically. `converged` identifies finite numerical convergence; `mean_resolved` includes analytically infinite means; `infinite_mean` distinguishes them. Use `restricted_remaining_life_expectancy`, `survival_at_end`, `remaining_expectation_bound` and `survival_forever_lower_bound` for diagnostics. Export the UI's assumptions JSON alongside sensitivity CSVs to record the chosen settings.

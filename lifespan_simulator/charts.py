@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from itertools import cycle
-from math import inf
+from math import ceil, inf
 
 import pandas as pd
 import plotly.express as px
@@ -138,6 +138,19 @@ def build_survival_figure(baseline_curve: pd.DataFrame, scenario_curve: pd.DataF
     )
     fig.update_layout(base_layout("Synthetic Cohort Survival Curve", "Survival probability (%)"))
     fig.update_yaxes(range=[0, 100])
+    # Keep the full computed curves available while initially focusing on the
+    # ages covering 99% of deaths. An unreached percentile uses the full horizon.
+    curves = (baseline_curve, scenario_curve)
+    focus_ends = []
+    for curve in curves:
+        crossed = curve.loc[curve.survival <= 0.01, "age"]
+        focus_ends.append(crossed.iloc[0] if not crossed.empty else curve.age.iloc[-1])
+    horizon = max(curve.age.iloc[-1] for curve in curves)
+    end = min(horizon, max(110, ceil(max(focus_ends)) + 10))
+    fig.update_xaxes(
+        range=[min(curve.age.iloc[0] for curve in curves), end],
+        rangeslider={"visible": True, "thickness": 0.12},
+    )
     return fig
 
 
@@ -223,7 +236,7 @@ def format_metric(value: float | None, digits: int = 1) -> str:
     if value is None:
         return "Unresolved"
     if value == inf:
-        return "inf"
+        return "∞"
     return f"{value:.{digits}f}"
 
 
@@ -231,7 +244,7 @@ def format_percentile_age(value: float | None) -> str:
     if value is None:
         return "Beyond horizon"
     if value == inf:
-        return "inf"
+        return "∞"
     return f"{value:.1f}"
 
 
