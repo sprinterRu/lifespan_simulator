@@ -52,24 +52,29 @@ def build_scenario_map(raw_scenarios: dict[str, dict[str, Any] | tuple]) -> Scen
 
 
 def intervention_multiplier(years: np.ndarray, config: InterventionConfig) -> np.ndarray:
-    """Include the first annual reduction in the specified start year."""
+    """Apply the floor to slow improvements, then compound fast improvements freely."""
+    return np.exp(log_intervention_multiplier(years, config))
+
+
+def log_intervention_multiplier(years: np.ndarray, config: InterventionConfig) -> np.ndarray:
+    """Include the first reduction in its start year, retaining tiny fast effects."""
     slow_years = np.clip(
         years - config.slow_start_year + 1, 0, config.fast_start_year - config.slow_start_year
     )
     fast_years = np.maximum(0, years - config.fast_start_year + 1)
 
-    def stage(rate: float, duration: np.ndarray) -> np.ndarray:
+    def log_stage(rate: float, duration: np.ndarray) -> np.ndarray:
         if rate == 1:
-            return np.where(duration > 0, 0.0, 1.0)
-        return np.exp(np.log1p(-rate) * duration)
+            return np.where(duration > 0, -np.inf, 0.0)
+        return np.log1p(-rate) * duration
 
-    return np.maximum(
-        config.floor, stage(config.slow_rate, slow_years) * stage(config.fast_rate, fast_years)
+    return np.maximum(np.log(config.floor), log_stage(config.slow_rate, slow_years)) + log_stage(
+        config.fast_rate, fast_years
     )
 
 
 def limiting_intervention_multiplier(config: InterventionConfig) -> float:
     """A zero fast rate preserves the completed slow stage instead of reaching the floor."""
     if config.fast_rate > 0:
-        return config.floor
+        return 0.0
     return float(intervention_multiplier(np.array([config.fast_start_year]), config)[0])

@@ -35,7 +35,7 @@ def test_unresolved_mean_has_no_gain_arrow_and_explains_remaining_survival():
     causes = next(
         widget for widget in app.multiselect if widget.label == "Causes to modify in the scenario"
     )
-    causes.set_value(causes.options).run()
+    causes.set_value([name for name in causes.options if name != "Falls"]).run()
     assert not app.exception
 
     mean = next(metric for metric in app.metric if metric.label == "Scenario mean age at death")
@@ -64,3 +64,25 @@ def test_unresolved_mean_has_no_gain_arrow_and_explains_remaining_survival():
     mean = next(metric for metric in app.metric if metric.label == "Scenario mean age at death")
     assert lower - 0.05 <= float(mean.value) <= upper + 0.05
     assert float(mean.delta) > 0
+
+
+def test_floor_free_fast_displays_infinite_mean_separately_from_horizon_failure():
+    app = AppTest.from_file("app.py", default_timeout=30).run()
+    causes = next(
+        widget for widget in app.multiselect if widget.label == "Causes to modify in the scenario"
+    )
+    causes.set_value(causes.options).run()
+    assert not app.exception
+    mean = next(metric for metric in app.metric if metric.label == "Scenario mean age at death")
+    assert mean.value == "∞" and mean.delta == ""
+    assert any("full mean is infinite under this model" in item.value for item in app.info)
+    assert not any("not resolved" in item.value for item in app.warning)
+    assert any(widget.label.startswith("Slow-stage floor") for widget in app.number_input)
+    next(
+        widget for widget in app.checkbox if widget.label == "Run sensitivity analysis"
+    ).check().run()
+    assert not app.exception
+    sensitivity = next(
+        table.value for table in app.dataframe if "Assumption" in table.value.columns
+    )
+    assert sensitivity.iloc[0]["Mean status"] == "Infinite"

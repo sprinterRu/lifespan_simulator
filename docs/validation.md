@@ -25,15 +25,18 @@ The official ex values are rounded to 0.1 years. The age-95 discrepancy remains 
 
 For a cohort aged 35 in 2021, the current defaults (calibrated Kannisto, 2011–2019 trends, 50-year trend horizon, fading COVID) give mean age **84.536**, median **87.386**, and p99 **102.555** without interventions.
 
-Applying the standard two-stage intervention to every cause and deliberately shortening the horizon to age 200 gives:
+With the floor applying only to slow improvements, applying the standard intervention to every cause gives an analytically **infinite mean**. The median is **90.550**, p90 **106.043**, and p95 **118.788**. At least **3.687%** of the cohort retains positive limiting survival under the indefinite fast-reduction assumption, so p99 is infinite. Moving fast to 2065 for every cause gives median **98.285** and limiting survival at least **31.683%**; p75 and later percentiles are infinite. These statements concern the mathematical model, not real-world immortality.
 
-- Median age **90.550**; p90 **106.043**; p95 **118.788**.
-- **56.659 expected remaining years lived before age 200** (restricted mean).
-- **2.198% alive at age 200**.
-- An upper bound of **2.507 additional expected life-years** after that horizon.
-- Full mean and p99 marked **unresolved / beyond horizon**.
+For finite life-extension examples, apply the same settings to every cause **except falls (`W00-W19`)**, retaining that residual risk:
 
-The new default horizon of 2,000 resolves this same scenario: mean age **94.166**, p99 **289.812**, with an omitted contribution bounded by **3.5 × 10⁻⁷ years**. Moving the fast start to 2065 for all causes gives mean age **136.683**, median **98.285**, and p99 **522.447**, with a remainder bound of **2.7 × 10⁻⁶ years**. Increasing the horizon again to 10,000 changes both means by less than 0.00001 years. No intervention, ageing or pandemic parameter was changed to obtain convergence.
+| Fast start | Mean at age-200 horizon | Mean at age-2,000 horizon | Median | p99 | Remaining mean bound at 2,000 |
+|---|---|---:|---:|---:|---:|
+| 2080 | Unresolved | 92.928 | 90.461 | 262.094 | 6.7 × 10⁻⁷ years |
+| 2065 | Unresolved | 129.936 | 97.219 | 518.332 | 5.6 × 10⁻⁶ years |
+
+Increasing the horizon again to 10,000 changes either finite mean by less than 0.00001 years.
+
+For dementia alone, slow 1.5% from 2040, fast 99.9% from 2065, and slow floor 1% give **0.1193 deaths per 100,000** at age 79, **0.0001645** at age 80, and approximately **7.30 × 10⁻⁹³** at age 110. The former 1% cap no longer stops fast reductions.
 
 These are conditional model outputs, not predictions of medical progress. The changes deliberately alter the previous defaults (pandemic treatment, trend fitting window/horizon, calibration and older-age continuation), so the old/new output difference should not be attributed to a single assumption.
 

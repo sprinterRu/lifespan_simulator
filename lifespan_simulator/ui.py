@@ -123,12 +123,8 @@ def format_delta(baseline: float | None, scenario: float | None) -> str | None:
     """Omit an unavailable metric delta so Streamlit does not draw a gain arrow."""
     if baseline is None or scenario is None:
         return None
-    if baseline == inf and scenario == inf:
-        return "0.0"
-    if baseline == inf:
+    if not isfinite(baseline) or not isfinite(scenario):
         return None
-    if scenario == inf:
-        return "inf"
     return f"{scenario - baseline:+.1f}"
 
 
@@ -254,11 +250,15 @@ def render_interventions(
                 "Slow reduction",
                 "Fast start",
                 "Fast reduction",
-                "Floor",
+                "Slow floor",
             ],
             strict=True,
         ):
             column.caption(label)
+        st.caption(
+            "Slow floor limits only gradual improvements. Fast compounds on the attained slow multiplier "
+            "without a floor: 0.1 leaves 90% each year; 1 eliminates this cause from the fast start year."
+        )
         for cause_name in intervention_causes:
             cause_code = all_cause_options[cause_name]
             label_col, slow_year_col, slow_rate_col, fast_year_col, fast_rate_col, floor_col = (
@@ -309,17 +309,19 @@ def render_interventions(
                     step=0.01,
                     format="%.3f",
                     key=f"fast_rate_{cause_code}",
+                    help="Annual reduction after the breakthrough, without a floor. 0.1 means 10% per year.",
                     label_visibility="collapsed",
                 )
             with floor_col:
                 floor = st.number_input(
-                    f"Irreducible floor for {cause_name}",
+                    f"Slow-stage floor for {cause_name}",
                     min_value=1e-12,
                     max_value=1.0,
                     value=FLOOR_DEFAULT,
                     step=0.001,
                     format="%.4f",
                     key=f"floor_{cause_code}",
+                    help="Minimum multiplier from slow improvements only. Fast can reduce risk below this value.",
                     label_visibility="collapsed",
                 )
             scenario_inputs[cause_code] = {
@@ -445,11 +447,11 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         "Scenario mean age at death",
         format_metric(scenario.life_expectancy_age),
         format_delta(baseline.life_expectancy_age, scenario.life_expectancy_age),
-        help="Unresolved means the remaining contribution to the mean cannot be bounded within the numerical error limit. See the mean's bounds below; the simulation has still completed.",
+        help="Unresolved means more tail integration is needed. ∞ means the model analytically retains positive survival forever, so its full mean is infinite. See the diagnostics below.",
     )
     metrics[2].metric("Scenario remaining years", format_metric(scenario.remaining_life_expectancy))
     metrics[3].metric("Scenario median age", format_percentile_age(scenario.percentiles["p50"]))
-    if not baseline.converged or not scenario.converged:
+    if not baseline.mean_resolved or not scenario.mean_resolved:
         st.warning(
             f"Simulation completed, but the full mean is not resolved by age {config.max_age}. "
             "Survivors beyond that age could still materially affect the mean under the selected assumptions. "
@@ -459,6 +461,13 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         )
     diagnostics = []
     for label, result in [("Baseline", baseline), ("Scenario", scenario)]:
+        if result.infinite_mean:
+            st.info(
+                f"{label}: the full mean is infinite under this model. "
+                "All remaining mortality terms eventually decay fast enough to leave positive limiting survival. "
+                "A longer horizon cannot produce a finite mean. Restricted life-years and reached percentiles "
+                "remain available; this is a consequence of the scenario assumptions."
+            )
         lower_mean_age = initial_age + result.restricted_remaining_life_expectancy
         upper_mean_age = lower_mean_age + result.remaining_expectation_bound
         if not result.converged:
@@ -477,7 +486,15 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
                 "Mean age at death: upper bound": upper_mean_age
                 if isfinite(upper_mean_age)
                 else None,
-                "Full mean resolved": result.converged,
+                "Limiting survival: lower bound (%)": 100 * result.survival_forever_lower_bound
+                if result.survival_forever_lower_bound is not None
+                else None,
+                "Mean status": "Infinite"
+                if result.infinite_mean
+                else "Resolved"
+                if result.converged
+                else "Unresolved",
+                "Full mean resolved": result.mean_resolved,
             }
         )
     with st.expander(
@@ -489,9 +506,10 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
             "Expected years before the horizon is a restricted mean. Adding the initial age gives the "
             "lower bound on mean age at death; adding the omitted life-years bound gives the upper bound. "
             "A blank upper mean bound means no finite bound was established, not proof of an infinite mean. "
-            "A resolved full mean has at most "
+            "A finite resolved mean has at most "
             f"{config.expectation_tolerance:g} years of omitted tail contribution under the selected assumptions. "
             "These are numerical bounds within the model, not confidence intervals or bounds on forecast uncertainty."
+            " Limiting survival bounds apply only when an infinite mean has been established analytically."
         )
 
     age_bands = available_top_cause_age_bands(frame, initial_age)
@@ -564,6 +582,7 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         "initial_age": initial_age,
         "projection": asdict(config),
         "interventions": {code: value._asdict() for code, value in scenarios.items()},
+        "intervention_floor_applies_to": "slow stage only",
         "historical_trends": "2011–2019" if use_trends else "disabled",
         "reference_population": "Spain, males, 2021",
     }
@@ -593,7 +612,7 @@ def render_sensitivity(
         figure.add_trace(
             go.Bar(
                 y=results.Assumption,
-                x=results[column],
+                x=results[column].replace([inf, -inf], float("nan")),
                 name=column,
                 orientation="h",
                 marker_color=color,
@@ -602,7 +621,7 @@ def render_sensitivity(
     figure.update_layout(
         barmode="group",
         height=max(480, len(results) * 34),
-        xaxis_title="Mean age at death (resolved projections only)",
+        xaxis_title="Mean age at death (finite, resolved projections only)",
         yaxis={"autorange": "reversed"},
         template="plotly_white",
     )
@@ -610,6 +629,7 @@ def render_sensitivity(
     st.dataframe(results, hide_index=True)
     st.caption(
         f"Blank means/percentiles extend beyond the age-{config.max_age} calculation or fail its remainder bound. "
+        "Infinite means are identified analytically and appear in the table, not as bars. "
         "Restricted expected years use the same horizon in every row. Slope variations have no effect in flat mode; "
         "trend variations have no effect when trends are disabled."
     )

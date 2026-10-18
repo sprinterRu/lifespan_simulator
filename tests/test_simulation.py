@@ -70,7 +70,9 @@ def test_total_and_cause_charts_use_the_same_hazards_as_survival(model):
 
 
 def test_extreme_scenario_reports_unresolved_mean_and_keeps_entire_curve(model):
-    scenario = build_scenario_map({code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes})
+    scenario = build_scenario_map(
+        {code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes if code != "W00-W19"}
+    )
     result = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=200))
     assert not result.converged and result.life_expectancy_age is None
     assert result.percentiles["p50"] is not None and result.percentiles["p99"] is None
@@ -85,9 +87,9 @@ def test_extreme_scenario_reports_unresolved_mean_and_keeps_entire_curve(model):
 
 
 @pytest.mark.parametrize("fast_year", [2065, 2080])
-def test_default_horizon_resolves_all_cause_life_extension(model, fast_year):
+def test_default_horizon_resolves_life_extension_with_residual_falls(model, fast_year):
     scenario = build_scenario_map(
-        {code: (2040, 0.015, fast_year, 0.1, 0.01) for code in model.codes}
+        {code: (2040, 0.015, fast_year, 0.1, 0.01) for code in model.codes if code != "W00-W19"}
     )
     short = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=200))
     result = simulate_survival(model, 35, scenario)
@@ -104,7 +106,7 @@ def test_default_horizon_resolves_all_cause_life_extension(model, fast_year):
 
 
 def test_ten_millennia_horizon_resolves_centuries_long_lifetimes(constant_model, fixed_config):
-    scenario = build_scenario_map({"X": (2021, 1, 2021, 1, 0.02)})
+    scenario = build_scenario_map({"X": (2021, 1, 2022, 0, 0.02)})
     result = simulate_survival(constant_model, 35, scenario, replace(fixed_config, max_age=10_000))
     assert result.converged
     assert result.life_expectancy_age == pytest.approx(535, abs=0.001)
@@ -114,7 +116,9 @@ def test_ten_millennia_horizon_resolves_centuries_long_lifetimes(constant_model,
 
 def test_survival_chart_keeps_distant_tail_accessible_without_compressing_main_curve(model):
     baseline = simulate_survival(model, 35)
-    scenario = build_scenario_map({code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes})
+    scenario = build_scenario_map(
+        {code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes if code != "W00-W19"}
+    )
     result = simulate_survival(model, 35, scenario)
     figure = build_survival_figure(baseline.survival_curve, result.survival_curve)
     assert figure.layout.xaxis.rangeslider.visible
@@ -124,7 +128,7 @@ def test_survival_chart_keeps_distant_tail_accessible_without_compressing_main_c
 
 @pytest.mark.parametrize("mode", ["flat", "kannisto", "gompertz"])
 def test_long_horizon_has_valid_survival_with_extreme_interventions(model, mode):
-    scenario = build_scenario_map({code: (2021, 1, 2021, 1, 1e-12) for code in model.codes})
+    scenario = build_scenario_map({code: (2021, 1, 2021, 0.1, 1e-12) for code in model.codes})
     config = ProjectionConfig(
         max_age=10_000,
         old_age_model=mode,
@@ -142,7 +146,7 @@ def test_long_horizon_has_valid_survival_with_extreme_interventions(model, mode)
     if mode == "gompertz":
         assert result.converged and result.survival_at_end == 0
     else:
-        assert not result.converged and result.survival_at_end > 0.99
+        assert result.infinite_mean and result.survival_at_end > 0
 
 
 @pytest.mark.parametrize("rate", [1e-20, 0.00001, 1.0])
@@ -160,7 +164,7 @@ def test_intervention_stage_boundaries():
     )
     config = config._replace(slow_rate=1)
     np.testing.assert_allclose(
-        intervention_multiplier(np.array([2039, 2040, 2042]), config), [1, 0.01, 0.01]
+        intervention_multiplier(np.array([2039, 2040, 2042]), config), [1, 0.01, 0.008]
     )
 
 
@@ -197,7 +201,7 @@ def test_future_bound_is_valid_for_each_supported_age_model(model):
 
 
 def test_omitted_integral_is_bounded_with_low_hazards(constant_model, fixed_config):
-    scenario = build_scenario_map({"X": (2021, 1, 2021, 1, 0.01)})
+    scenario = build_scenario_map({"X": (2021, 1, 2022, 0, 0.01)})
     result = simulate_survival(constant_model, 35, scenario, replace(fixed_config, max_age=120))
     exact_remaining = 1 / 0.001
     assert not result.converged
@@ -205,3 +209,58 @@ def test_omitted_integral_is_bounded_with_low_hazards(constant_model, fixed_conf
         result.restricted_remaining_life_expectancy + result.remaining_expectation_bound
         == pytest.approx(exact_remaining)
     )
+
+
+def test_slow_floor_does_not_limit_fast_improvements():
+    config = build_scenario_map({"X": (2040, 1, 2065, 0.1, 0.5)})["X"]
+    np.testing.assert_allclose(
+        intervention_multiplier(np.array([2039, 2040, 2064, 2065, 2074]), config),
+        [1, 0.5, 0.5, 0.45, 0.5 * 0.9**10],
+    )
+    unchanged_fast = config._replace(fast_rate=0)
+    assert intervention_multiplier(np.array([2100]), unchanged_fast)[0] == pytest.approx(0.5)
+
+
+def test_dementia_breakthrough_keeps_reducing_below_slow_floor(model):
+    scenarios = build_scenario_map({"F01_F03": (2040, 0.015, 2065, 0.999, 0.01)})
+    rates = project_cause_rates(model, 35, ["F01_F03"], scenarios, 110)
+    fast = rates[rates.calendar_year >= 2065]
+    assert fast.scenario_rate.is_monotonic_decreasing
+    assert fast.scenario_rate.iloc[-1] < 1e-80
+
+
+def test_geometric_hazard_has_infinite_mean_and_known_limiting_survival(
+    constant_model, fixed_config
+):
+    scenarios = build_scenario_map({"X": (2021, 0, 2021, 0.1, 0.5)})
+    result = simulate_survival(constant_model, 35, scenarios, fixed_config)
+    assert result.infinite_mean and result.mean_resolved and not result.converged
+    assert result.survival_forever_lower_bound == pytest.approx(exp(-0.9))
+    assert np.isfinite(result.percentiles["p50"])
+    assert result.percentiles["p75"] == float("inf")
+
+
+@pytest.mark.parametrize("mode", ["flat", "kannisto", "gompertz"])
+def test_complete_fast_elimination_remains_zero_at_remote_ages(model, mode):
+    scenarios = build_scenario_map({code: (2021, 0, 2021, 1, 0.5) for code in model.codes})
+    config = ProjectionConfig(max_age=10_000, old_age_model=mode)
+    result = simulate_survival(model, 35, scenarios, config)
+    assert (result.annual_projection.hazard == 0).all()
+    assert result.infinite_mean and result.survival_forever_lower_bound == 1
+    assert result.restricted_remaining_life_expectancy == 10_000 - 35
+    assert all(age == float("inf") for age in result.percentiles.values())
+
+
+def test_future_elimination_beyond_horizon_is_not_misreported_as_finite(
+    constant_model, fixed_config
+):
+    scenarios = build_scenario_map({"X": (2021, 0, 2120, 1, 0.5)})
+    result = simulate_survival(constant_model, 35, scenarios, replace(fixed_config, max_age=100))
+    assert result.infinite_mean
+    assert result.survival_forever_lower_bound == pytest.approx(exp(-0.1 * (2120 - 2021)))
+
+
+def test_fast_improvements_can_outpace_gompertz_ageing(model):
+    scenario = build_scenario_map({code: (2040, 0.015, 2065, 0.5, 0.01) for code in model.codes})
+    result = simulate_survival(model, 35, scenario, ProjectionConfig(old_age_model="gompertz"))
+    assert result.infinite_mean and result.survival_forever_lower_bound > 0

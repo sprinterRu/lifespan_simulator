@@ -236,7 +236,7 @@ def format_metric(value: float | None, digits: int = 1) -> str:
     if value is None:
         return "Unresolved"
     if value == inf:
-        return "inf"
+        return "∞"
     return f"{value:.{digits}f}"
 
 
@@ -244,7 +244,7 @@ def format_percentile_age(value: float | None) -> str:
     if value is None:
         return "Beyond horizon"
     if value == inf:
-        return "inf"
+        return "∞"
     return f"{value:.1f}"
 
 
