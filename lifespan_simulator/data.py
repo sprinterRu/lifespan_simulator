@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DATA_PATH = Path(__file__).resolve().parents[1] / "mortality.csv"
+REFERENCE_DIR = DATA_PATH.parent / "data"
 
 # The source mixes mutually exclusive causes with overlapping roll-ups.
 # These roll-ups are excluded from the simulator totals to avoid double-counting.
@@ -53,22 +55,43 @@ def load_mortality_data(path: str | Path = DATA_PATH) -> pd.DataFrame:
         }
     )
 
+    required = {"age_code", "age_label", "cause_code", "cause_name", "year", "rate"}
+    if not required.issubset(frame):
+        raise ValueError(f"Missing mortality columns: {sorted(required - set(frame))}")
+    if frame[list(required)].isna().any().any():
+        raise ValueError("Missing mortality observation; absence is not a zero rate")
+    if frame.duplicated(["year", "age_code", "cause_code"]).any():
+        raise ValueError("Duplicate year/age/cause observations")
+
     age_parts = frame.apply(
-        lambda row: _parse_age_bucket(row["age_code"], row["age_label"]), axis=1, result_type="expand"
+        lambda row: _parse_age_bucket(row["age_code"], row["age_label"]),
+        axis=1,
+        result_type="expand",
     )
     age_parts.columns = ["age_start", "age_end", "age_display"]
 
     frame = pd.concat([frame, age_parts], axis=1)
     frame["year"] = frame["year"].astype(int)
     frame["rate"] = frame["rate"].astype(float)
-    frame["age_mid"] = frame["age_start"] + frame["age_end"].fillna(99).sub(frame["age_start"]).div(2)
+    if not np.isfinite(frame["rate"]).all() or (frame["rate"] < 0).any():
+        raise ValueError("Mortality rates must be finite and non-negative")
+    frame["age_mid"] = frame["age_start"] + frame["age_end"].fillna(99).sub(frame["age_start"]).div(
+        2
+    )
 
     return frame.sort_values(["year", "age_start", "cause_name"]).reset_index(drop=True)
 
 
 def get_simulator_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """Return the 2021 non-overlapping cause set used for survival simulation."""
-    simulator = frame[(frame["year"] == 2021) & (~frame["cause_code"].isin(SIMULATOR_EXCLUDED_CAUSES))].copy()
+    simulator = frame[
+        (frame["year"] == 2021) & (~frame["cause_code"].isin(SIMULATOR_EXCLUDED_CAUSES))
+    ].copy()
+    expected_ages = set(range(35, 100, 5))
+    if simulator.empty or any(
+        set(group.age_start) != expected_ages for _, group in simulator.groupby("cause_code")
+    ):
+        raise ValueError("Every 2021 simulator cause must cover ages 35–95+")
     return simulator.sort_values(["age_start", "cause_name"]).reset_index(drop=True)
 
 
@@ -83,3 +106,11 @@ def get_display_horizon(initial_age: int) -> int:
     """Pick a chart horizon that is readable for both younger and older cohorts."""
     return min(max(110, initial_age + 20), 125)
 
+
+def load_official_life_table() -> pd.DataFrame:
+    """Read the checked-in Eurostat 2021 Mx/ex snapshot without network access."""
+    return pd.read_csv(REFERENCE_DIR / "spain_male_2021_life_table.csv", dtype={"age": str})
+
+
+def load_official_cause_totals() -> pd.DataFrame:
+    return pd.read_csv(REFERENCE_DIR / "spain_male_2021_all_causes.csv")

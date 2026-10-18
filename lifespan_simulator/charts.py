@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from itertools import cycle
 from math import inf
-import re
 
-import plotly.graph_objects as go
-import plotly.express as px
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
 PALETTE = [
     "#0f766e",
@@ -61,12 +61,24 @@ def build_cause_projection_figure(frame: pd.DataFrame) -> go.Figure:
         )
 
     layout = {
-        "title": {"text": "Cause-Specific Mortality Paths", "x": 0.01, "yanchor": "bottom", "y": 0.95},
+        "title": {
+            "text": "Cause-Specific Mortality Paths",
+            "x": 0.01,
+            "yanchor": "bottom",
+            "y": 0.95,
+        },
         "template": "plotly_white",
         "height": 420,
         "hovermode": "x unified",
         "margin": {"l": 20, "r": 20, "t": 60, "b": 20},
-        "legend": {"orientation": "h", "yanchor": "bottom", "y": 0.95, "xanchor": "left", "x": 0, "bgcolor": "rgba(0,0,0,0)"},
+        "legend": {
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 0.95,
+            "xanchor": "left",
+            "x": 0,
+            "bgcolor": "rgba(0,0,0,0)",
+        },
         "xaxis_title": "Attained age",
         "yaxis_title": "Deaths per 100,000",
     }
@@ -110,7 +122,7 @@ def build_survival_figure(baseline_curve: pd.DataFrame, scenario_curve: pd.DataF
             y=baseline_curve["survival"] * 100,
             mode="lines",
             name="Baseline survival",
-            line={"color": "#94a3b8", "width": 3, "shape": "hv"},
+            line={"color": "#94a3b8", "width": 3},
             hovertemplate="Age %{x}<br>Baseline survival: %{y:.2f}%<extra></extra>",
         )
     )
@@ -120,7 +132,7 @@ def build_survival_figure(baseline_curve: pd.DataFrame, scenario_curve: pd.DataF
             y=scenario_curve["survival"] * 100,
             mode="lines",
             name="Scenario survival",
-            line={"color": "#0f766e", "width": 3, "shape": "hv"},
+            line={"color": "#0f766e", "width": 3},
             hovertemplate="Age %{x}<br>Scenario survival: %{y:.2f}%<extra></extra>",
         )
     )
@@ -129,7 +141,9 @@ def build_survival_figure(baseline_curve: pd.DataFrame, scenario_curve: pd.DataF
     return fig
 
 
-def build_trend_figure(frames: dict[str, pd.DataFrame], age_label: str, log_scale: bool) -> go.Figure:
+def build_trend_figure(
+    frames: dict[str, pd.DataFrame], age_label: str, log_scale: bool
+) -> go.Figure:
     fig = go.Figure()
     color_cycle = cycle(px.colors.qualitative.Safe)
 
@@ -188,7 +202,14 @@ def build_trend_figure(frames: dict[str, pd.DataFrame], age_label: str, log_scal
             "height": 480,
             "hovermode": "x unified",
             "margin": {"l": 20, "r": 20, "t": 60, "b": 20},
-            "legend": {"orientation": "h", "yanchor": "bottom", "y": 0.95, "xanchor": "left", "x": 0, "bgcolor": "rgba(0,0,0,0)"},
+            "legend": {
+                "orientation": "h",
+                "yanchor": "bottom",
+                "y": 0.95,
+                "xanchor": "left",
+                "x": 0,
+                "bgcolor": "rgba(0,0,0,0)",
+            },
             "xaxis_title": "Year",
             "yaxis_title": "Deaths per 100,000",
         }
@@ -198,7 +219,9 @@ def build_trend_figure(frames: dict[str, pd.DataFrame], age_label: str, log_scal
     return fig
 
 
-def format_metric(value: float, digits: int = 1) -> str:
+def format_metric(value: float | None, digits: int = 1) -> str:
+    if value is None:
+        return "Unresolved"
     if value == inf:
         return "inf"
     return f"{value:.{digits}f}"
@@ -206,7 +229,7 @@ def format_metric(value: float, digits: int = 1) -> str:
 
 def format_percentile_age(value: float | None) -> str:
     if value is None:
-        return "Not reached"
+        return "Beyond horizon"
     if value == inf:
         return "inf"
     return f"{value:.1f}"

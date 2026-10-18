@@ -1,0 +1,40 @@
+{
+  "retrieved_at": "2026-10-18T18:14:59.019584+00:00",
+  "population": "Spain, males, 2021",
+  "sources": [
+    {
+      "dataset": "demo_mlifetable",
+      "url": "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/demo_mlifetable?lang=EN&geo=ES&sex=M&time=2021",
+      "updated": "2026-09-25T23:00:00+0200",
+      "response_sha256": "0dae1f395a904cd7886a443628f244ad688c02ab7e8bc8ddc1d6777917368f55"
+    },
+    {
+      "dataset": "hlth_cd_acdr2",
+      "url": "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/hlth_cd_acdr2?lang=EN&geo=ES&sex=M&time=2021&icd10=A-R_V-Y",
+      "updated": "2026-06-08T23:00:00+0200",
+      "response_sha256": "a7dfd0617f6a6029ef0cb6db67529ea8b03b7c72185fb3e4092287c8a274a730"
+    }
+  ],
+  "files": [
+    {
+      "file": "spain_male_2021_life_table.csv",
+      "sha256": "e1f678699e50b776371258b9e22dca0158cda92d88e5c09cfe22eb8bb4d511ec",
+      "rows": 122
+    },
+    {
+      "file": "spain_male_2021_all_causes.csv",
+      "sha256": "6bdbab66d035ef8d095b36a5503f121e711853634cb8c29b881625b49210ba07",
+      "rows": 13
+    }
+  ],
+  "units": {
+    "DEATHRATE": "Deaths per person-year (Mx), not probability qx",
+    "LIFEXP": "Remaining years at exact age (ex)",
+    "all_causes_rate": "Deaths per 100,000 population"
+  },
+  "notes": [
+    "95+ is an open age group, not a single-year observation.",
+    "Cause-of-death rates and life-table rates use different statistical production methods; equality is not assumed.",
+    "mortality.csv predates this snapshot; its original extraction metadata are unavailable."
+  ]
+}
