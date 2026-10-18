@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from math import inf
+from math import inf, isfinite
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,7 +19,12 @@ from .charts import (
     format_metric,
     format_percentile_age,
 )
-from .config import PandemicConfig, ProjectionConfig
+from .config import (
+    DEFAULT_INTEGRATION_END_AGE,
+    MAX_INTEGRATION_END_AGE,
+    PandemicConfig,
+    ProjectionConfig,
+)
 from .data import get_display_horizon, load_official_cause_totals
 from .interventions import ScenarioMap, build_scenario_map
 from .mortality import MortalityModel
@@ -114,24 +119,22 @@ def default_explorer_causes(raw_frame: pd.DataFrame, age_label: str) -> list[str
     )
 
 
-def format_delta(baseline: float, scenario: float) -> str:
-    """Format the difference between a scenario metric and its baseline value."""
+def format_delta(baseline: float | None, scenario: float | None) -> str | None:
+    """Omit an unavailable metric delta so Streamlit does not draw a gain arrow."""
     if baseline is None or scenario is None:
-        return "n/a"
+        return None
     if baseline == inf and scenario == inf:
         return "0.0"
     if baseline == inf:
-        return "n/a"
+        return None
     if scenario == inf:
         return "inf"
     return f"{scenario - baseline:+.1f}"
 
 
 def format_optional_delta(baseline: float | None, scenario: float | None) -> str:
-    """Format a metric delta when either side may be unavailable."""
-    if baseline is None or scenario is None:
-        return "n/a"
-    return format_delta(baseline, scenario)
+    """Use a text placeholder for unavailable deltas in the percentile table."""
+    return format_delta(baseline, scenario) or "n/a"
 
 
 def format_slope_ci(stats: dict[str, object]) -> str:
@@ -382,13 +385,13 @@ def render_projection_controls() -> tuple[int, bool, ProjectionConfig]:
             trend_horizon = st.slider(
                 "Years of trend extrapolation after 2021", 0, 100, 50, disabled=not use_trends
             )
-            max_age = st.slider(
+            max_age = st.number_input(
                 "Numerical integration end age",
-                120,
-                500,
-                200,
-                10,
-                help="A computational horizon, not a maximum human lifespan. Unresolved means are not extrapolated.",
+                min_value=100,
+                max_value=MAX_INTEGRATION_END_AGE,
+                value=DEFAULT_INTEGRATION_END_AGE,
+                step=100,
+                help="A computational horizon, not a maximum human lifespan. Default 2,000 years; increase up to 10,000 for longer-lived scenarios. The remaining-tail check still applies.",
             )
         st.caption(
             "The COVID fade parameters are assumptions, not estimates of future outbreaks. "
@@ -442,32 +445,53 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         "Scenario mean age at death",
         format_metric(scenario.life_expectancy_age),
         format_delta(baseline.life_expectancy_age, scenario.life_expectancy_age),
+        help="Unresolved means the remaining contribution to the mean cannot be bounded within the numerical error limit. See the mean's bounds below; the simulation has still completed.",
     )
     metrics[2].metric("Scenario remaining years", format_metric(scenario.remaining_life_expectancy))
     metrics[3].metric("Scenario median age", format_percentile_age(scenario.percentiles["p50"]))
     if not baseline.converged or not scenario.converged:
         st.warning(
-            f"Full life expectancy is unresolved within age {config.max_age}. "
-            "The remaining survivors could materially change the mean. "
-            "Increase the numerical horizon or compare restricted life-years below; no constant-risk tail is assumed."
+            f"Simulation completed, but the full mean is not resolved by age {config.max_age}. "
+            "Survivors beyond that age could still materially affect the mean under the selected assumptions. "
+            "The median can still be known: it only requires half of the cohort to have died. "
+            "See the survival percentages and numerical bounds below. Increasing the horizon may narrow "
+            "the bounds, but does not guarantee a resolved mean."
         )
     diagnostics = []
     for label, result in [("Baseline", baseline), ("Scenario", scenario)]:
+        lower_mean_age = initial_age + result.restricted_remaining_life_expectancy
+        upper_mean_age = lower_mean_age + result.remaining_expectation_bound
+        if not result.converged:
+            st.caption(
+                f"{label}: {100 * result.survival_at_end:.2f}% of the modeled cohort is still alive "
+                f"at age {config.max_age}. Expected remaining years lived before that age: "
+                f"{result.restricted_remaining_life_expectancy:.2f}."
+            )
         diagnostics.append(
             {
                 "Projection": label,
                 f"Expected remaining years lived before {config.max_age}": result.restricted_remaining_life_expectancy,
                 f"Alive at {config.max_age} (%)": 100 * result.survival_at_end,
                 "Unintegrated life-years upper bound": result.remaining_expectation_bound,
+                "Mean age at death: lower bound": lower_mean_age,
+                "Mean age at death: upper bound": upper_mean_age
+                if isfinite(upper_mean_age)
+                else None,
                 "Full mean resolved": result.converged,
             }
         )
-    with st.expander("Numerical horizon and remaining survival", expanded=not scenario.converged):
+    with st.expander(
+        "Numerical horizon and remaining survival",
+        expanded=not baseline.converged or not scenario.converged,
+    ):
         st.dataframe(pd.DataFrame(diagnostics), hide_index=True)
         st.caption(
-            "Expected years before the horizon is a restricted mean. A resolved full mean has at most "
+            "Expected years before the horizon is a restricted mean. Adding the initial age gives the "
+            "lower bound on mean age at death; adding the omitted life-years bound gives the upper bound. "
+            "A blank upper mean bound means no finite bound was established, not proof of an infinite mean. "
+            "A resolved full mean has at most "
             f"{config.expectation_tolerance:g} years of omitted tail contribution under the selected assumptions. "
-            "This numerical bound is not a bound on forecast uncertainty."
+            "These are numerical bounds within the model, not confidence intervals or bounds on forecast uncertainty."
         )
 
     age_bands = available_top_cause_age_bands(frame, initial_age)
@@ -509,7 +533,9 @@ def render_simulator_tab(frame: pd.DataFrame, official: pd.DataFrame, trend: Tre
         build_survival_figure(baseline.survival_curve, scenario.survival_curve), width="stretch"
     )
     st.caption(
-        "The curve includes the full numerical horizon. p75 is the age by which 75% of the cohort has died; "
+        "The curve includes the full numerical horizon; use the range slider to explore the tail. "
+        "The initial view covers at least 99% of deaths when that percentile is reached. "
+        "p75 is the age by which 75% of the cohort has died; "
         "these percentiles describe individual lifespans under one model, not confidence in the forecast."
     )
     st.dataframe(

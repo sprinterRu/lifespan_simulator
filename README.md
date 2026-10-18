@@ -37,7 +37,7 @@ uv run ruff format --check .
 | Trend bounds | 15% to 2× the age-specific baseline; extrapolate for 50 years after 2021, then hold time factors fixed |
 | COVID | Fade from its 2021 rate with a 3-year half-life toward a 10% residual share |
 | Intervention | Slow start 2040, reduction 1.5%/year; fast start 2080, reduction 10%/year; residual multiplier 1% |
-| Numerical horizon | Age 200, selectable up to 500; not a maximum human lifespan |
+| Numerical horizon | Age 2,000, editable from 100 to 10,000; not a maximum human lifespan |
 
 COVID fade, trend bounds/horizon and intervention values are **scenario assumptions**, not estimates of medical progress. The non-COVID 2021 baseline may retain indirect pandemic effects. Interventions apply additional reductions relative to the chosen baseline; avoid counting the same progress in both the trend and the intervention.
 
@@ -45,9 +45,11 @@ COVID fade, trend bounds/horizon and intervention values are **scenario assumpti
 
 - **Mean age at death** is initial age plus expected remaining life. It is not life expectancy at birth.
 - **p75** is the age by which 75% of the modeled cohort has died. Percentiles are not confidence intervals for the forecast.
-- **Unresolved** means that surviving beyond the numerical horizon could materially affect the full mean. The app shows expected remaining years lived *before the horizon*, remaining survival and an upper bound on omitted life-years instead of inventing a constant-risk tail.
+- **Unresolved** means the simulation completed, but surviving beyond the numerical horizon prevents a sufficiently precise full mean. The median can still be known because it only requires half of the cohort to have died. The app shows expected remaining years lived *before the horizon*, remaining survival, an upper bound on omitted life-years, and numerical lower/upper bounds on mean age at death. An unavailable mean has no gain indicator. Increase the horizon up to age 10,000 for longer-lived scenarios; especially small residual hazards can still leave the mean unresolved.
+- Mean-age bounds are obtained by adding the initial age to the restricted remaining years, then adding the omitted life-years bound for the upper endpoint. A blank upper mean bound means no finite bound was established, not proof of an infinite mean. These bounds describe numerical integration under the selected model, not uncertainty about future medical progress; no constant-risk tail is assumed.
 - A resolved mean omits at most **0.001 years** under the selected model. This is numerical error control, not forecast accuracy.
 - **Beyond horizon** means a percentile was not reached within the calculation; it does not imply immortality.
+- The survival plot retains the entire computed horizon, with a range slider for exploring distant ages. Its initial view covers at least 99% of deaths if that percentile was reached, avoiding a mostly empty plot out to age 2,000.
 - Sensitivity rows are deterministic alternatives, not samples from a probability distribution or a confidence band.
 
 ## Reference data and reproducibility

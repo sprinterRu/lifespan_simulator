@@ -4,6 +4,7 @@ from math import exp, log
 import numpy as np
 import pytest
 
+from lifespan_simulator.charts import build_survival_figure
 from lifespan_simulator.config import PandemicConfig, ProjectionConfig
 from lifespan_simulator.interventions import build_scenario_map, intervention_multiplier
 from lifespan_simulator.simulation import (
@@ -70,7 +71,7 @@ def test_total_and_cause_charts_use_the_same_hazards_as_survival(model):
 
 def test_extreme_scenario_reports_unresolved_mean_and_keeps_entire_curve(model):
     scenario = build_scenario_map({code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes})
-    result = simulate_survival(model, 35, scenario)
+    result = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=200))
     assert not result.converged and result.life_expectancy_age is None
     assert result.percentiles["p50"] is not None and result.percentiles["p99"] is None
     assert result.survival_curve.age.iloc[-1] == 200
@@ -81,6 +82,67 @@ def test_extreme_scenario_reports_unresolved_mean_and_keeps_entire_curve(model):
         longer.restricted_remaining_life_expectancy - result.restricted_remaining_life_expectancy
     )
     assert 0 < extra < result.remaining_expectation_bound
+
+
+@pytest.mark.parametrize("fast_year", [2065, 2080])
+def test_default_horizon_resolves_all_cause_life_extension(model, fast_year):
+    scenario = build_scenario_map(
+        {code: (2040, 0.015, fast_year, 0.1, 0.01) for code in model.codes}
+    )
+    short = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=200))
+    result = simulate_survival(model, 35, scenario)
+    assert not short.converged
+    assert result.converged
+    assert result.integration_end_age == 2_000
+    assert result.remaining_expectation_bound <= 0.001
+    assert result.percentiles["p99"] > 200
+    assert result.percentiles["p50"] == pytest.approx(short.percentiles["p50"])
+    assert short.restricted_remaining_life_expectancy < result.remaining_life_expectancy
+    assert result.remaining_life_expectancy <= (
+        short.restricted_remaining_life_expectancy + short.remaining_expectation_bound
+    )
+
+
+def test_ten_millennia_horizon_resolves_centuries_long_lifetimes(constant_model, fixed_config):
+    scenario = build_scenario_map({"X": (2021, 1, 2021, 1, 0.02)})
+    result = simulate_survival(constant_model, 35, scenario, replace(fixed_config, max_age=10_000))
+    assert result.converged
+    assert result.life_expectancy_age == pytest.approx(535, abs=0.001)
+    assert result.percentiles["p99"] == pytest.approx(35 + log(100) / 0.002)
+    assert result.survival_curve.age.iloc[-1] == 10_000
+
+
+def test_survival_chart_keeps_distant_tail_accessible_without_compressing_main_curve(model):
+    baseline = simulate_survival(model, 35)
+    scenario = build_scenario_map({code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes})
+    result = simulate_survival(model, 35, scenario)
+    figure = build_survival_figure(baseline.survival_curve, result.survival_curve)
+    assert figure.layout.xaxis.rangeslider.visible
+    assert result.percentiles["p99"] < figure.layout.xaxis.range[1] < 2_000
+    assert max(figure.data[1].x) == 2_000
+
+
+@pytest.mark.parametrize("mode", ["flat", "kannisto", "gompertz"])
+def test_long_horizon_has_valid_survival_with_extreme_interventions(model, mode):
+    scenario = build_scenario_map({code: (2021, 1, 2021, 1, 1e-12) for code in model.codes})
+    config = ProjectionConfig(
+        max_age=10_000,
+        old_age_model=mode,
+        old_age_slope_multiplier=2,
+        pandemic=PandemicConfig(mode="exclude"),
+    )
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        result = simulate_survival(model, 35, scenario, config)
+        rates = model.rates(np.array([10_000]), np.array([11_986]), config, scenario)
+    assert not np.isnan(rates).any()
+    assert (rates[:, model.covid_mask] == 0).all()
+    assert np.isfinite(result.survival_curve.survival).all()
+    assert np.isfinite(result.restricted_remaining_life_expectancy)
+    assert result.survival_curve.survival.is_monotonic_decreasing
+    if mode == "gompertz":
+        assert result.converged and result.survival_at_end == 0
+    else:
+        assert not result.converged and result.survival_at_end > 0.99
 
 
 @pytest.mark.parametrize("rate", [1e-20, 0.00001, 1.0])
@@ -105,7 +167,7 @@ def test_intervention_stage_boundaries():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"max_age": 1000},
+        {"max_age": 10_001},
         {"start_year": 2020},
         {"trend_floor": float("nan")},
         {"trend_ceiling": float("inf")},

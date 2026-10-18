@@ -13,7 +13,7 @@ from math import exp, expm1, log
 import numpy as np
 import pandas as pd
 
-from .config import BASE_YEAR, RATE_SCALE, ProjectionConfig
+from .config import BASE_YEAR, MAX_INTEGRATION_END_AGE, RATE_SCALE, ProjectionConfig
 from .interventions import ScenarioMap, build_scenario_map
 from .mortality import MortalityModel
 
@@ -86,8 +86,10 @@ def _age_year_grid(
 ) -> tuple[np.ndarray, np.ndarray]:
     if not isinstance(initial_age, int) or not model.minimum_age <= initial_age <= 95:
         raise ValueError(f"Initial age must be an integer between {model.minimum_age} and 95")
-    if not initial_age <= end_age <= 500:
-        raise ValueError("Projection end age must lie between the initial age and 500")
+    if not initial_age <= end_age <= MAX_INTEGRATION_END_AGE:
+        raise ValueError(
+            f"Projection end age must lie between the initial age and {MAX_INTEGRATION_END_AGE}"
+        )
     ages = np.arange(initial_age, end_age + 1)
     return ages, config.start_year + ages - initial_age
 
@@ -101,7 +103,10 @@ def simulate_survival(
     config = config or ProjectionConfig()
     scenarios = build_scenario_map(scenario_map or {})
     ages, years = _age_year_grid(model, initial_age, config.max_age, config)
-    hazards = model.rates(ages, years, config, scenarios).sum(axis=1) / RATE_SCALE
+    # Gompertz hazards can exceed floating-point range at remote ages. Infinite
+    # hazards have a well-defined zero-survival limit, unlike NaN values.
+    with np.errstate(over="ignore"):
+        hazards = model.rates(ages, years, config, scenarios).sum(axis=1) / RATE_SCALE
     survival = 1.0
     expectation = 0.0
     rows = []
@@ -153,9 +158,11 @@ def _survival_curve(annual: pd.DataFrame) -> pd.DataFrame:
     """Sample the within-year exponential, keeping the entire numerical horizon."""
     fractions = np.array([0.0, 0.25, 0.50, 0.75])
     ages = annual.age_start.to_numpy()[:, None] + fractions
-    survival = annual.survival_start.to_numpy()[:, None] * np.exp(
-        -annual.hazard.to_numpy()[:, None] * fractions
-    )
+    # At the start of an interval the exponent is zero, even if its hazard is
+    # beyond floating-point range; avoid the undefined product inf * 0.
+    exponents = np.zeros(ages.shape)
+    np.multiply(annual.hazard.to_numpy()[:, None], fractions, out=exponents, where=fractions > 0)
+    survival = annual.survival_start.to_numpy()[:, None] * np.exp(-exponents)
     return pd.DataFrame(
         {
             "age": np.append(ages.ravel(), annual.age_end.iloc[-1]),

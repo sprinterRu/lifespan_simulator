@@ -13,6 +13,12 @@ from .interventions import ScenarioMap, intervention_multiplier, limiting_interv
 TrendTable = dict[int, dict[str, float]]
 
 
+def _log_nonnegative(values: np.ndarray | float) -> np.ndarray:
+    """Represent zero rates/multipliers as -inf without logarithm warnings."""
+    values = np.asarray(values, dtype=float)
+    return np.log(values, out=np.full_like(values, -np.inf), where=values > 0)
+
+
 class MortalityModel:
     """Prepare interpolation arrays once, then share them across scenarios.
 
@@ -115,7 +121,12 @@ class MortalityModel:
         }
 
     def baseline_total(self, ages: np.ndarray, config: ProjectionConfig) -> np.ndarray:
-        totals = self._observed_total(np.minimum(ages, 94), config.calibrate)
+        with np.errstate(over="ignore"):
+            return np.exp(self._log_baseline_hazard(ages, config)) * RATE_SCALE
+
+    def _log_baseline_hazard(self, ages: np.ndarray, config: ProjectionConfig) -> np.ndarray:
+        """Keep exponential ageing finite until all risk multipliers are combined."""
+        totals = np.log(self._observed_total(np.minimum(ages, 94), config.calibrate) / RATE_SCALE)
         beyond = ages > 94
         if not beyond.any():
             return totals
@@ -125,17 +136,17 @@ class MortalityModel:
                 if config.calibrate
                 else self._raw_rates(np.array([95])).sum()
             )
-            totals[beyond] = terminal
+            totals[beyond] = np.log(terminal / RATE_SCALE)
             return totals
         fit = self.old_age_fit(config)
         years = ages[beyond] - 94
         anchor = fit["anchor_hazard"]
         slope = fit[config.old_age_model + "_slope"] * config.old_age_slope_multiplier
         if config.old_age_model == "kannisto":
-            hazards = 1 / (1 + (1 / anchor - 1) * np.exp(-slope * years))
+            log_hazards = -np.logaddexp(0, np.log(1 / anchor - 1) - slope * years)
         else:
-            hazards = anchor * np.exp(slope * years)
-        totals[beyond] = hazards * RATE_SCALE
+            log_hazards = np.log(anchor) + slope * years
+        totals[beyond] = log_hazards
         return totals
 
     def rates(
@@ -146,33 +157,47 @@ class MortalityModel:
         scenarios: ScenarioMap | None = None,
     ) -> np.ndarray:
         """Resolve all causes together; return rates per 100,000, not probabilities."""
+        with np.errstate(over="ignore"):
+            return np.exp(self._log_rates(ages, years, config, scenarios))
+
+    def _log_rates(
+        self,
+        ages: np.ndarray,
+        years: np.ndarray,
+        config: ProjectionConfig,
+        scenarios: ScenarioMap | None = None,
+    ) -> np.ndarray:
         ages, years = np.asarray(ages), np.asarray(years)
         raw = self._raw_rates(ages)
         total = raw.sum(axis=1)
         if (total <= 0).any():
             raise ValueError("Cause totals must be positive at every projected age")
-        scale = self.baseline_total(ages, config) / total
+        log_scale = self._log_baseline_hazard(ages, config) - np.log(total / RATE_SCALE)
         elapsed = np.clip(years - BASE_YEAR, 0, config.trend_horizon_years)
         projected = raw + self._trend_slopes(ages) * elapsed[:, None]
         projected = np.maximum(raw * config.trend_floor, projected)
         # A zero observed cause rate does not impose a zero ceiling on new risk.
         projected = np.minimum(np.where(raw > 0, raw * config.trend_ceiling, np.inf), projected)
-        projected *= scale[:, None]
+        log_rates = _log_nonnegative(projected) + log_scale[:, None]
         pandemic = config.pandemic
         if pandemic.mode == "exclude":
-            covid_multiplier = np.zeros(len(years))
+            log_covid_multiplier = np.full(len(years), -np.inf)
         elif pandemic.mode == "hold_2021":
-            covid_multiplier = np.ones(len(years))
+            log_covid_multiplier = np.zeros(len(years))
         else:
-            covid_multiplier = pandemic.residual_fraction + (
-                1 - pandemic.residual_fraction
-            ) * np.exp2(-np.maximum(0, years - BASE_YEAR) / pandemic.half_life_years)
-        projected[:, self.covid_mask] *= covid_multiplier[:, None]
+            log_decay = -np.log(2) * np.maximum(0, years - BASE_YEAR) / pandemic.half_life_years
+            log_residual, log_fading_share = _log_nonnegative(
+                np.array([pandemic.residual_fraction, 1 - pandemic.residual_fraction])
+            )
+            log_covid_multiplier = np.logaddexp(log_residual, log_fading_share + log_decay)
+        log_rates[:, self.covid_mask] += log_covid_multiplier[:, None]
         for code, intervention in (scenarios or {}).items():
             if code not in self.codes:
                 raise ValueError(f"Unknown intervention cause: {code}")
-            projected[:, self.codes.index(code)] *= intervention_multiplier(years, intervention)
-        return projected
+            log_rates[:, self.codes.index(code)] += _log_nonnegative(
+                intervention_multiplier(years, intervention)
+            )
+        return log_rates
 
     def future_hazard_lower_bound(
         self, age: int, year: int, config: ProjectionConfig, scenarios: ScenarioMap
@@ -186,13 +211,16 @@ class MortalityModel:
         if age < 95:
             raise ValueError("Tail bound requires age at least 95")
         fixed_pandemic = replace(config, pandemic=PandemicConfig(mode="hold_2021"))
-        rates = self.rates(
+        log_rates = self._log_rates(
             np.array([age, age]),
             np.array([year, max(year, BASE_YEAR + config.trend_horizon_years)]),
             fixed_pandemic,
         )
-        lower = rates.min(axis=0)
-        lower[self.covid_mask] *= config.pandemic.limiting_multiplier
+        log_lower = log_rates.min(axis=0)
+        log_lower[self.covid_mask] += _log_nonnegative(config.pandemic.limiting_multiplier)
         for code, intervention in scenarios.items():
-            lower[self.codes.index(code)] *= limiting_intervention_multiplier(intervention)
-        return float(lower.sum() / RATE_SCALE)
+            log_lower[self.codes.index(code)] += _log_nonnegative(
+                limiting_intervention_multiplier(intervention)
+            )
+        with np.errstate(over="ignore"):
+            return float(np.exp(np.logaddexp.reduce(log_lower) - np.log(RATE_SCALE)))

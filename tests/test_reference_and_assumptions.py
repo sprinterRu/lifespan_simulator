@@ -79,6 +79,29 @@ def test_covid_has_separate_path_and_non_covid_is_unchanged(model):
     )
 
 
+def test_remote_age_combines_overflowing_baseline_and_underflowing_decay(inputs):
+    _, frame, official = inputs
+    model = MortalityModel(frame, official_life_table=official)
+    config = ProjectionConfig(
+        max_age=10_000,
+        old_age_model="gompertz",
+        old_age_slope_multiplier=2,
+        pandemic=PandemicConfig(residual_fraction=0),
+    )
+    fit = model.old_age_fit(config)
+    source = frame[frame.age_start == 95].set_index("cause_code").rate
+    log_hazard = np.log(fit["anchor_hazard"]) + 2 * fit["gompertz_slope"] * (10_000 - 94)
+    log_decay = -np.log(2) * (11_986 - 2021) / 3
+    assert log_hazard > 710 and log_decay < -745
+    expected = np.exp(log_hazard + np.log(100_000 * source["U071"] / source.sum()) + log_decay)
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        actual = model.rates(np.array([10_000]), np.array([11_986]), config)[
+            0, model.codes.index("U071")
+        ]
+    assert np.isfinite(actual) and actual > 0
+    assert actual == pytest.approx(expected)
+
+
 def test_pre_pandemic_trends_do_not_learn_from_future_years(inputs):
     raw, frame, _ = inputs
     first = build_trend_model(raw, frame)

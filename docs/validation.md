@@ -25,13 +25,15 @@ The official ex values are rounded to 0.1 years. The age-95 discrepancy remains 
 
 For a cohort aged 35 in 2021, the current defaults (calibrated Kannisto, 2011–2019 trends, 50-year trend horizon, fading COVID) give mean age **84.536**, median **87.386**, and p99 **102.555** without interventions.
 
-Applying the standard two-stage intervention to every cause gives:
+Applying the standard two-stage intervention to every cause and deliberately shortening the horizon to age 200 gives:
 
 - Median age **90.550**; p90 **106.043**; p95 **118.788**.
 - **56.659 expected remaining years lived before age 200** (restricted mean).
 - **2.198% alive at age 200**.
 - An upper bound of **2.507 additional expected life-years** after that horizon.
 - Full mean and p99 marked **unresolved / beyond horizon**.
+
+The new default horizon of 2,000 resolves this same scenario: mean age **94.166**, p99 **289.812**, with an omitted contribution bounded by **3.5 × 10⁻⁷ years**. Moving the fast start to 2065 for all causes gives mean age **136.683**, median **98.285**, and p99 **522.447**, with a remainder bound of **2.7 × 10⁻⁶ years**. Increasing the horizon again to 10,000 changes both means by less than 0.00001 years. No intervention, ageing or pandemic parameter was changed to obtain convergence.
 
 These are conditional model outputs, not predictions of medical progress. The changes deliberately alter the previous defaults (pandemic treatment, trend fitting window/horizon, calibration and older-age continuation), so the old/new output difference should not be attributed to a single assumption.
 
@@ -43,7 +45,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-The suite covers analytical constant-hazard integrals and percentiles, monotone survival, conservation of deaths plus survivors, no-op intervention equivalence, agreement between charts and survival, intervention boundary years, stable tiny/100% reductions, finite computation, tail bounds and unresolved extreme scenarios, reference checksums and calibration, older-age continuity, explicit COVID decay, leakage-free pre-pandemic trend preparation, CSV round trips and non-finite input rejection, and Streamlit interactions with scenarios and sensitivity results.
+The suite covers analytical constant-hazard integrals and percentiles, including a 500-year expected remaining lifetime integrated to age 10,000; monotone survival; conservation of deaths plus survivors; no-op intervention equivalence; agreement between charts and survival; intervention boundary years; stable tiny/100% reductions; Gompertz overflow and excluded causes at remote ages; tail bounds and unresolved extreme scenarios; reference checksums and calibration; older-age continuity; explicit COVID decay; leakage-free pre-pandemic trend preparation; CSV round trips and non-finite input rejection; and Streamlit interactions with scenarios, horizons and sensitivity results.
 
 GitHub Actions repeats the checks on Python 3.10 and 3.13. No test refreshes data or contacts Eurostat.
 

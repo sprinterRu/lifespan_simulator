@@ -9,6 +9,8 @@ RATE_SCALE = 100_000.0
 COVID_CODES = frozenset({"U071", "U072", "U_COV19_OTH"})
 TREND_FLOOR_FRACTION_DEFAULT = 0.15
 TREND_CEILING_MULTIPLIER_DEFAULT = 2.0
+DEFAULT_INTEGRATION_END_AGE = 2_000
+MAX_INTEGRATION_END_AGE = 10_000
 
 
 @dataclass(frozen=True)
@@ -52,7 +54,7 @@ class ProjectionConfig:
     trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT
     trend_ceiling: float = TREND_CEILING_MULTIPLIER_DEFAULT
     trend_horizon_years: int = 50
-    max_age: int = 200
+    max_age: int = DEFAULT_INTEGRATION_END_AGE
     expectation_tolerance: float = 0.001
 
     def __post_init__(self) -> None:
@@ -74,7 +76,9 @@ class ProjectionConfig:
             or not 0 <= self.trend_horizon_years <= 100
         ):
             raise ValueError("Trend horizon must be an integer from zero to 100 years")
-        if not isinstance(self.max_age, int) or not 100 <= self.max_age <= 500:
-            raise ValueError("Integration end age must be an integer between 100 and 500")
+        if not isinstance(self.max_age, int) or not 100 <= self.max_age <= MAX_INTEGRATION_END_AGE:
+            raise ValueError(
+                f"Integration end age must be an integer between 100 and {MAX_INTEGRATION_END_AGE}"
+            )
         if not isfinite(self.expectation_tolerance) or not 0 < self.expectation_tolerance <= 0.01:
             raise ValueError("Expectation tolerance must be positive and at most 0.01 years")

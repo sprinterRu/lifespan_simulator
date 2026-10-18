@@ -68,14 +68,16 @@ S(a + 1) = S(a) × exp(-h)
 life-years in interval = S(a) × (1 - exp(-h)) / h
 ```
 
-For `h=0`, the contribution is `S(a)`. `expm1` provides stable integration when hazards are tiny. Percentile crossing times use the inverse exponential within the year. The plotted curve samples these exponentials quarterly and displays the whole numerical horizon.
+For `h=0`, the contribution is `S(a)`. `expm1` provides stable integration when hazards are tiny. Percentile crossing times use the inverse exponential within the year. The plotted curve samples these exponentials quarterly and retains the whole numerical horizon. Its initial zoom covers at least 99% of deaths when that percentile is reached; a range slider exposes the rest of the horizon.
 
-The integration ends at a configurable age `H` (default 200, allowed maximum 500). This bounds computation; it is not a maximum age at death. We retain:
+The integration ends at a configurable age `H` (default 2,000, allowed range 100–10,000). This supports radical life-extension scenarios while bounding computation; it is not a maximum age at death. We retain:
 
 - the restricted expected remaining years before `H`;
 - survival `S(H)`;
 - percentiles reached before `H`;
 - an upper bound on the remaining expected life-years.
+
+Old-age hazards, cause scaling, COVID decay and intervention effects are combined in logarithms before exponentiation. This avoids overflowing a Gompertz baseline before a small multiplier is applied, or forming `inf * 0` for excluded causes. A final hazard beyond floating-point range is represented as infinity and integrated using its zero-survival, zero-life-years limit; no artificial maximum hazard is imposed. Survival at the exact start of such an interval is retained explicitly. These numerical protections do not make extrapolations to remote ages empirically validated.
 
 For ages at least 95, source cause shares/slopes are fixed and baseline old-age totals are non-decreasing. A conservative future lower hazard `h_min` is constructed from the smaller endpoint of each bounded time trend, the limiting COVID multiplier, and each intervention's limiting multiplier. Consequently:
 
