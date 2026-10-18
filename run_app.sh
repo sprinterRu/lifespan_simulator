@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 
-uv run streamlit run app.py
+exec uv run streamlit run app.py --server.fileWatcherType poll --server.runOnSave true "$@"

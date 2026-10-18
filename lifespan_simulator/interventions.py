@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
-from math import isfinite
+from math import expm1, isfinite, log1p
 from typing import Any, NamedTuple
 
 import numpy as np
+
+FAST_NET_REDUCTION_DEFAULT = 0.10
+
+
+def default_fast_rate(age_log_growth: float = 0.0) -> float:
+    """Offset exponential ageing, then retain 90% of the previous year's hazard.
+
+    exp(b) * (1 - fast_rate) = 0.9. This sets an initial treatment parameter;
+    it does not change the meaning of manually entered or imported reductions.
+    Other age families pass b=0 and retain the ordinary 10% default.
+    """
+    if not isfinite(age_log_growth) or age_log_growth < 0:
+        raise ValueError("Exponential age growth must be finite and non-negative")
+    return -expm1(log1p(-FAST_NET_REDUCTION_DEFAULT) - age_log_growth)
 
 
 class InterventionConfig(NamedTuple):

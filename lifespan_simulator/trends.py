@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .config import COVID_CODES
+from .data import merge_dementia
 
 T_CRITICAL_95 = {
     1: 12.706,
@@ -127,10 +128,17 @@ def build_trend_model(
     raw_frame: pd.DataFrame, simulator_frame: pd.DataFrame, end_year: int = 2019
 ) -> TrendModel:
     """Build significant cause-age trend slopes for survival simulation."""
-    simulator_keys = simulator_frame[["age_start", "cause_code"]].drop_duplicates()
+    simulator_keys = simulator_frame.loc[
+        simulator_frame.age_start < 95, ["age_start", "cause_code"]
+    ].drop_duplicates()
     # Pandemic years can be explored in the UI but are excluded from the default
     # secular trend fit. COVID itself always follows a separate scenario path.
-    history = raw_frame[(raw_frame.year <= end_year) & ~raw_frame.cause_code.isin(COVID_CODES)]
+    history = merge_dementia(raw_frame[raw_frame.age_start < 95])
+    history = history[
+        (history.year <= end_year)
+        & (history.age_start < 95)
+        & ~history.cause_code.isin(COVID_CODES)
+    ]
     trend_source = history.merge(simulator_keys, on=["age_start", "cause_code"], how="inner")
 
     slope_table: dict[int, dict[str, float]] = {}

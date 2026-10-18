@@ -29,17 +29,20 @@ def test_reference_snapshot_checksums():
 
 def test_cause_totals_remain_auditable(inputs):
     audit = compare_cause_totals(inputs[1], load_official_cause_totals())
-    assert len(audit) == 13
+    assert len(audit) == 12
+    assert audit.age_start.max() == 90
     assert audit.difference.abs().max() < 4
     assert 0.5 < audit.difference_pct.abs().max() < 0.6
 
 
-def test_calibrated_period_life_expectancy_matches_reference(inputs):
-    comparison = compare_life_expectancy(inputs[1], inputs[2])
-    assert (comparison.loc[comparison.age < 95, "calibrated_difference"].abs() < 0.1).all()
-    # 95+ is extrapolated, and the discrepancy must stay visible rather than
+@pytest.mark.parametrize("difference", ["calibrated_difference", "individual_difference"])
+def test_calibrated_period_life_expectancy_matches_reference(inputs, model, difference):
+    comparison = compare_life_expectancy(inputs[1], inputs[2], model.tail_fits)
+    assert (comparison.loc[comparison.age < 94, difference].abs() < 0.1).all()
+    # Beyond 94 is extrapolated, and the discrepancy must stay visible rather than
     # being fitted away using the same validation statistic.
-    assert comparison.loc[comparison.age == 95, "calibrated_difference"].abs().iloc[0] < 0.3
+    assert comparison.loc[comparison.age == 94, difference].abs().iloc[0] < 0.3
+    assert comparison.age.max() == 94
 
 
 def test_calibration_preserves_cause_shares_and_matches_mx(inputs):
@@ -57,7 +60,7 @@ def test_calibration_preserves_cause_shares_and_matches_mx(inputs):
 
 def test_old_age_curve_is_continuous_increasing_and_bounded(inputs):
     model = MortalityModel(inputs[1], official_life_table=inputs[2])
-    config = ProjectionConfig()
+    config = ProjectionConfig(old_age_model="kannisto")
     rates = (
         model.baseline_total(np.array([94, 94.000001, 95, 100, 130, 200, 500]), config) / 100_000
     )
@@ -90,7 +93,7 @@ def test_remote_age_combines_overflowing_baseline_and_underflowing_decay(inputs)
         pandemic=PandemicConfig(residual_fraction=0),
     )
     fit = model.old_age_fit(config)
-    source = frame[frame.age_start == 95].set_index("cause_code").rate
+    source = frame[frame.age_start == 90].set_index("cause_code").rate
     log_hazard = np.log(fit["anchor_hazard"]) + 2 * fit["gompertz_slope"] * (10_000 - 94)
     log_decay = -np.log(2) * (11_986 - 2021) / 3
     assert log_hazard > 710 and log_decay < -745
@@ -109,7 +112,7 @@ def test_remote_age_preserves_fast_multiplier_before_exponentiation(inputs):
     config = ProjectionConfig(old_age_model="gompertz", old_age_slope_multiplier=2)
     scenarios = build_scenario_map({"C33_C34": (2021, 0, 2021, 0.2, 0.5)})
     fit = model.old_age_fit(config)
-    source = frame[frame.age_start == 95].set_index("cause_code").rate
+    source = frame[frame.age_start == 90].set_index("cause_code").rate
     log_hazard = np.log(fit["anchor_hazard"]) + 2 * fit["gompertz_slope"] * (10_000 - 94)
     log_reduction = np.log(0.8) * (11_986 - 2021 + 1)
     assert log_hazard > 710 and log_reduction < -745
@@ -127,10 +130,10 @@ def test_pre_pandemic_trends_do_not_learn_from_future_years(inputs):
     raw, frame, _ = inputs
     first = build_trend_model(raw, frame)
     changed = raw.copy()
-    changed.loc[changed.year >= 2020, "rate"] *= 1000
+    changed.loc[(changed.year >= 2020) | (changed.age_start == 95), "rate"] *= 1000
     second = build_trend_model(changed, frame)
     assert first == second
-    assert first.total_count == 66 * 13
+    assert first.total_count == 65 * 12
     assert all(not code.startswith("U") for rates in first.slope_table.values() for code in rates)
 
 

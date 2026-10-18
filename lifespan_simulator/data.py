@@ -10,6 +10,9 @@ import pandas as pd
 
 DATA_PATH = Path(__file__).resolve().parents[1] / "mortality.csv"
 REFERENCE_DIR = DATA_PATH.parent / "data"
+DEMENTIA_CODE = "F01_F03_G30"
+DEMENTIA_NAME = "Dementia including Alzheimer disease"
+DEMENTIA_COMPONENTS = frozenset({"F01_F03", "G30"})
 
 # The source mixes mutually exclusive causes with overlapping roll-ups.
 # These roll-ups are excluded from the simulator totals to avoid double-counting.
@@ -85,20 +88,46 @@ def load_mortality_data(path: str | Path = DATA_PATH) -> pd.DataFrame:
 def get_simulator_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """Return the 2021 non-overlapping cause set used for survival simulation."""
     simulator = frame[
-        (frame["year"] == 2021) & (~frame["cause_code"].isin(SIMULATOR_EXCLUDED_CAUSES))
+        (frame["year"] == 2021)
+        & (frame.age_start < 95)
+        & (~frame["cause_code"].isin(SIMULATOR_EXCLUDED_CAUSES))
     ].copy()
-    expected_ages = set(range(35, 100, 5))
+    expected_ages = set(range(35, 95, 5))
     if simulator.empty or any(
         set(group.age_start) != expected_ages for _, group in simulator.groupby("cause_code")
     ):
-        raise ValueError("Every 2021 simulator cause must cover ages 35–95+")
-    return simulator.sort_values(["age_start", "cause_name"]).reset_index(drop=True)
+        raise ValueError("Every 2021 simulator cause must cover closed groups 35–94")
+    return merge_dementia(simulator).sort_values(["age_start", "cause_name"]).reset_index(drop=True)
+
+
+def merge_dementia(frame: pd.DataFrame) -> pd.DataFrame:
+    """Sum disjoint underlying-cause codes before fitting any age or time trend.
+
+    The original history remains available in the explorer. Reject incomplete
+    pairs instead of interpreting an absent Alzheimer's/dementia cell as zero.
+    """
+    members = frame[frame.cause_code.isin(DEMENTIA_COMPONENTS)]
+    if members.empty:
+        return frame.copy()
+    if DEMENTIA_CODE in set(frame.cause_code):
+        raise ValueError("Combined dementia and its components must not coexist")
+    keys = ["year", "age_start"]
+    if not (members.groupby(keys).cause_code.nunique() == 2).all():
+        raise ValueError("Dementia merge requires both component causes at every year/age")
+    combined = members[members.cause_code == "F01_F03"].copy().set_index(keys)
+    combined["rate"] = members.groupby(keys).rate.sum()
+    combined["cause_code"] = DEMENTIA_CODE
+    combined["cause_name"] = DEMENTIA_NAME
+    return pd.concat(
+        [frame[~frame.cause_code.isin(DEMENTIA_COMPONENTS)], combined.reset_index()],
+        ignore_index=True,
+    )
 
 
 def get_age_bucket_start(age: int) -> int:
     """Map an attained age to the dataset's age bucket."""
-    if age >= 95:
-        return 95
+    if age >= 90:
+        return 90
     return 35 + ((age - 35) // 5) * 5
 
 
@@ -109,8 +138,10 @@ def get_display_horizon(initial_age: int) -> int:
 
 def load_official_life_table() -> pd.DataFrame:
     """Read the checked-in Eurostat 2021 Mx/ex snapshot without network access."""
-    return pd.read_csv(REFERENCE_DIR / "spain_male_2021_life_table.csv", dtype={"age": str})
+    frame = pd.read_csv(REFERENCE_DIR / "spain_male_2021_life_table.csv", dtype={"age": str})
+    return frame[frame.age != "95+"].reset_index(drop=True)
 
 
 def load_official_cause_totals() -> pd.DataFrame:
-    return pd.read_csv(REFERENCE_DIR / "spain_male_2021_all_causes.csv")
+    frame = pd.read_csv(REFERENCE_DIR / "spain_male_2021_all_causes.csv")
+    return frame[frame.age_code != "Y_GE95"].reset_index(drop=True)

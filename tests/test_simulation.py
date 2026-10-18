@@ -73,13 +73,18 @@ def test_extreme_scenario_reports_unresolved_mean_and_keeps_entire_curve(model):
     scenario = build_scenario_map(
         {code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes if code != "W00-W19"}
     )
-    result = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=200))
+    result = simulate_survival(
+        model, 35, scenario, ProjectionConfig(max_age=200, old_age_model="kannisto")
+    )
     assert not result.converged and result.life_expectancy_age is None
-    assert result.percentiles["p50"] is not None and result.percentiles["p99"] is None
+    assert result.percentiles["p50"] is not None
+    assert result.survival_at_end > 0
     assert result.survival_curve.age.iloc[-1] == 200
     assert result.survival_curve.survival.iloc[-1] == result.survival_at_end
     assert result.remaining_expectation_bound > 0.001
-    longer = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=500))
+    longer = simulate_survival(
+        model, 35, scenario, ProjectionConfig(max_age=500, old_age_model="kannisto")
+    )
     extra = (
         longer.restricted_remaining_life_expectancy - result.restricted_remaining_life_expectancy
     )
@@ -91,13 +96,18 @@ def test_default_horizon_resolves_life_extension_with_residual_falls(model, fast
     scenario = build_scenario_map(
         {code: (2040, 0.015, fast_year, 0.1, 0.01) for code in model.codes if code != "W00-W19"}
     )
-    short = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=200))
-    result = simulate_survival(model, 35, scenario)
+    short = simulate_survival(
+        model, 35, scenario, ProjectionConfig(max_age=200, old_age_model="kannisto")
+    )
+    result = simulate_survival(model, 35, scenario, ProjectionConfig(old_age_model="kannisto"))
     assert not short.converged
     assert result.converged
     assert result.integration_end_age == 2_000
     assert result.remaining_expectation_bound <= 0.001
-    assert result.percentiles["p99"] > 200
+    if short.percentiles["p99"] is None:
+        assert result.percentiles["p99"] > 200
+    else:
+        assert result.percentiles["p99"] == pytest.approx(short.percentiles["p99"])
     assert result.percentiles["p50"] == pytest.approx(short.percentiles["p50"])
     assert short.restricted_remaining_life_expectancy < result.remaining_life_expectancy
     assert result.remaining_life_expectancy <= (
@@ -119,7 +129,7 @@ def test_survival_chart_keeps_distant_tail_accessible_without_compressing_main_c
     scenario = build_scenario_map(
         {code: (2040, 0.015, 2080, 0.1, 0.01) for code in model.codes if code != "W00-W19"}
     )
-    result = simulate_survival(model, 35, scenario)
+    result = simulate_survival(model, 35, scenario, ProjectionConfig(old_age_model="kannisto"))
     figure = build_survival_figure(baseline.survival_curve, result.survival_curve)
     assert figure.layout.xaxis.rangeslider.visible
     assert result.percentiles["p99"] < figure.layout.xaxis.range[1] < 2_000
@@ -222,8 +232,8 @@ def test_slow_floor_does_not_limit_fast_improvements():
 
 
 def test_dementia_breakthrough_keeps_reducing_below_slow_floor(model):
-    scenarios = build_scenario_map({"F01_F03": (2040, 0.015, 2065, 0.999, 0.01)})
-    rates = project_cause_rates(model, 35, ["F01_F03"], scenarios, 110)
+    scenarios = build_scenario_map({"F01_F03_G30": (2040, 0.015, 2065, 0.999, 0.01)})
+    rates = project_cause_rates(model, 35, ["F01_F03_G30"], scenarios, 110)
     fast = rates[rates.calendar_year >= 2065]
     assert fast.scenario_rate.is_monotonic_decreasing
     assert fast.scenario_rate.iloc[-1] < 1e-80

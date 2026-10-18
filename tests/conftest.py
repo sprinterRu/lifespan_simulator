@@ -8,6 +8,7 @@ from lifespan_simulator.data import (
     load_official_life_table,
 )
 from lifespan_simulator.mortality import MortalityModel
+from lifespan_simulator.tails import fit_cause_tails
 from lifespan_simulator.trends import build_trend_model
 
 
@@ -22,7 +23,12 @@ def inputs():
 @pytest.fixture(scope="session")
 def model(inputs):
     raw, frame, official = inputs
-    return MortalityModel(frame, build_trend_model(raw, frame).slope_table, official)
+    return MortalityModel(
+        frame,
+        build_trend_model(raw, frame).slope_table,
+        official,
+        fit_cause_tails(raw, tuple(sorted(frame.cause_code.unique()))),
+    )
 
 
 @pytest.fixture

@@ -43,3 +43,38 @@ def test_source_duplicates_and_missing_rates_are_rejected(tmp_path):
     path.write_text(lines[0] + "\n" + lines[1].rsplit(",", 1)[0] + ",\n")
     with pytest.raises(ValueError, match="Missing"):
         load_mortality_data(path)
+
+
+def test_identical_legacy_dementia_rows_merge_losslessly():
+    from lifespan_simulator.data import DEMENTIA_CODE, DEMENTIA_NAME
+
+    original = build_scenario_map({code: (2040, 0.015, 2080, 0.1, 0.01) for code in ["D", "A"]})
+    table = active_interventions_frame(original, {"D": "Dementia", "A": "Alzheimer disease"})
+    names, values = parse_interventions_csv(
+        StringIO(table.to_csv(index=False)), {DEMENTIA_NAME: DEMENTIA_CODE}
+    )
+    assert names == [DEMENTIA_NAME]
+    assert build_scenario_map(values)[DEMENTIA_CODE] == original["D"]
+
+
+def test_single_legacy_dementia_intervention_is_not_silently_broadened():
+    from lifespan_simulator.data import DEMENTIA_CODE, DEMENTIA_NAME
+
+    original = build_scenario_map({"D": (2040, 0.015, 2080, 0.1, 0.01)})
+    table = active_interventions_frame(original, {"D": "Dementia"})
+    with pytest.raises(ValueError, match="both causes have identical"):
+        parse_interventions_csv(StringIO(table.to_csv(index=False)), {DEMENTIA_NAME: DEMENTIA_CODE})
+
+
+def test_conflicting_legacy_dementia_rows_require_explicit_combined_settings():
+    from lifespan_simulator.data import DEMENTIA_CODE, DEMENTIA_NAME
+
+    original = build_scenario_map(
+        {
+            "D": (2040, 0.015, 2080, 0.1, 0.01),
+            "A": (2040, 0.015, 2080, 0.2, 0.01),
+        }
+    )
+    table = active_interventions_frame(original, {"D": "Dementia", "A": "Alzheimer disease"})
+    with pytest.raises(ValueError, match="both causes have identical"):
+        parse_interventions_csv(StringIO(table.to_csv(index=False)), {DEMENTIA_NAME: DEMENTIA_CODE})
