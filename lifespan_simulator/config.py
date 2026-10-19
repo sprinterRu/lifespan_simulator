@@ -11,6 +11,7 @@ TREND_FLOOR_FRACTION_DEFAULT = 0.15
 TREND_CEILING_MULTIPLIER_DEFAULT = 2.0
 DEFAULT_INTEGRATION_END_AGE = 2_000
 MAX_INTEGRATION_END_AGE = 10_000
+DECLINE_RESIDUAL_DEFAULT = 0.25
 
 
 @dataclass(frozen=True)
@@ -50,7 +51,7 @@ class ProjectionConfig:
     calibrate: bool = True
     old_age_model: Literal["individual", "kannisto", "gompertz", "flat"] = "individual"
     old_age_slope_multiplier: float = 1.0
-    decline_residual_fraction: float = 0.0
+    decline_residual_fraction: float = DECLINE_RESIDUAL_DEFAULT
     pandemic: PandemicConfig = field(default_factory=PandemicConfig)
     trend_floor: float = TREND_FLOOR_FRACTION_DEFAULT
     trend_ceiling: float = TREND_CEILING_MULTIPLIER_DEFAULT

@@ -76,7 +76,12 @@ def test_covid_has_separate_path_and_non_covid_is_unchanged(model):
     fade = ProjectionConfig(trend_horizon_years=0)
     hold = replace(fade, pandemic=PandemicConfig(mode="hold_2021"))
     a, b = model.rates(ages, years, fade), model.rates(ages, years, hold)
-    np.testing.assert_allclose(a[:, ~model.covid_mask], b[:, ~model.covid_mask])
+    independent = ~model.covid_mask & np.array(
+        [code not in {"R96-R99", "R_OTH"} for code in model.codes]
+    )
+    np.testing.assert_allclose(a[:, independent], b[:, independent])
+    for code in ("R96-R99", "R_OTH"):
+        assert (a[:, model.codes.index(code)] <= b[:, model.codes.index(code)]).all()
     np.testing.assert_allclose(
         a[:, model.covid_mask].sum(axis=1) / b[:, model.covid_mask].sum(axis=1),
         [0.1 + 0.9 * 2 ** (-t / 3) for t in (0, 3, 30)],
@@ -133,7 +138,7 @@ def test_pre_pandemic_trends_do_not_learn_from_future_years(inputs):
     changed.loc[(changed.year >= 2020) | (changed.age_start == 95), "rate"] *= 1000
     second = build_trend_model(changed, frame)
     assert first == second
-    assert first.total_count == 65 * 12
+    assert first.total_count == 62 * 12
     assert all(not code.startswith("U") for rates in first.slope_table.values() for code in rates)
 
 

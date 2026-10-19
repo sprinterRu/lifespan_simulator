@@ -21,6 +21,7 @@ from .charts import (
     format_percentile_age,
 )
 from .config import (
+    DECLINE_RESIDUAL_DEFAULT,
     DEFAULT_INTEGRATION_END_AGE,
     MAX_INTEGRATION_END_AGE,
     PandemicConfig,
@@ -29,6 +30,7 @@ from .config import (
 from .data import (
     DEMENTIA_CODE,
     DEMENTIA_NAME,
+    INAPPLICABLE_MALE_CAUSES,
     get_display_horizon,
     load_official_cause_totals,
     merge_dementia,
@@ -42,7 +44,7 @@ from .interventions import (
 from .mortality import MortalityModel
 from .scenario_io import active_interventions_frame, parse_interventions_csv
 from .simulation import project_cause_rates, project_total_rates, simulate_survival
-from .tails import CauseTailFit, TailCurve, tail_fit_table
+from .tails import FAMILY_LABELS, CauseTailFit, TailCurve, tail_fit_table
 from .trends import TrendModel, build_trend_frame
 
 EXPLORER_CAUSE_SELECTION_KEY = "explorer_selected_causes"
@@ -190,7 +192,9 @@ def age_band_details(simulator_frame: pd.DataFrame, age_start: int) -> tuple[int
 
 def render_explorer_tab(raw_frame: pd.DataFrame) -> None:
     """Render the historical mortality-rate trend explorer."""
-    raw_frame = raw_frame[raw_frame.age_start < 95]
+    raw_frame = raw_frame[
+        (raw_frame.age_start < 95) & ~raw_frame.cause_code.isin(INAPPLICABLE_MALE_CAUSES)
+    ]
     age_labels = (
         raw_frame.drop_duplicates("age_start").sort_values("age_start")["age_label"].tolist()
     )
@@ -207,10 +211,15 @@ def render_explorer_tab(raw_frame: pd.DataFrame) -> None:
             st.session_state[EXPLORER_CAUSE_SELECTION_KEY] = default_explorer_causes(
                 raw_frame, age_label
             )
+        st.session_state[EXPLORER_CAUSE_SELECTION_KEY] = [
+            name
+            for name in st.session_state[EXPLORER_CAUSE_SELECTION_KEY]
+            if name in all_cause_names
+        ]
         selected_causes = st.multiselect(
             "Causes of death",
             options=all_cause_names,
-            help="The explorer keeps the full source dataset, including aggregate categories.",
+            help="Shows source series, including aggregates. The three zero-only uterine/ovarian cancer categories are hidden for this male population.",
             key=EXPLORER_CAUSE_SELECTION_KEY,
         )
     with toggle_col:
@@ -399,7 +408,7 @@ def render_projection_controls() -> tuple[int, bool, ProjectionConfig]:
                 "Mortality after age 94",
                 ["individual", "kannisto", "gompertz", "flat"],
                 format_func=lambda x: {
-                    "individual": "Individual cause trajectories (fitted)",
+                    "individual": "Individual cause trajectories (reviewed assumptions)",
                     "kannisto": "Kannisto (logistic)",
                     "gompertz": "Gompertz (exponential)",
                     "flat": "Flat after 94 (comparison only)",
@@ -430,10 +439,11 @@ def render_projection_controls() -> tuple[int, bool, ProjectionConfig]:
                 "Declining-tail residual share",
                 0.0,
                 0.5,
-                0.0,
+                DECLINE_RESIDUAL_DEFAULT,
                 0.05,
                 disabled=old_age != "individual",
-                help="Baseline declining curves approach this share of their age-94 rate. Fast interventions can still reduce it without a floor.",
+                key="decline_residual_reviewed_v2",
+                help="Assumed, not fitted: default 25% of the age-94 rate. Fast interventions can still reduce it without a floor.",
             )
             trend_floor = st.number_input(
                 "Trend floor", 0.0, 1.0, 0.15, 0.05, disabled=not use_trends
@@ -485,16 +495,17 @@ def render_simulator_tab(
     model = MortalityModel(frame, trend.slope_table if use_trends else None, official, active_tails)
     if config.old_age_model == "individual":
         st.caption(
-            "Each cause follows its own fitted tail after 94. See Cause trajectories for families, "
-            "validation errors and fallback assumptions. Dementia includes Alzheimer disease."
+            "Reviewed age curves use explicit scenario assumptions after 94. See Cause trajectories "
+            "for descriptions, reasons and parameters. Reporting categories follow their underlying causes."
         )
     if use_trends:
         st.caption(
-            f"Using {trend.significant_count} of {trend.total_count} non-COVID cause-age trends fitted through 2019. "
-            "The baseline is conditional on survival to the selected starting age and includes the chosen COVID path."
+            f"The 2011–2019 fit contains {trend.significant_count} significant slopes among {trend.total_count} non-COVID cause-age series. "
+            "Linked categories inherit donor trends in individual mode. The baseline is conditional on reaching the selected starting age."
         )
     options = cause_options(frame)
     exponential_growth = model.exponential_age_growth(config)
+    growing_causes = model.growing_causes(config)
     suggested_fast_rates = {
         code: default_fast_rate(exponential_growth.get(code, 0.0)) for code in model.codes
     }
@@ -511,17 +522,17 @@ def render_simulator_tab(
     if any(name not in options for name in previous):
         st.session_state[INTERVENTION_CAUSES_KEY] = [name for name in previous if name in options]
         st.warning(
-            "The cause list changed. Dementia and Alzheimer disease now share one intervention; "
-            "select the combined group to set its parameters."
+            "The cause list changed. Unavailable selections were removed. This male model excludes "
+            "cervical, other uterine and ovarian cancer; dementia includes Alzheimer disease."
         )
     if st.button(
-        "Select all exponentially growing causes",
-        disabled=not exponential_growth,
-        help="Adds every cause with a positive exponential slope in the active model, including custom trajectories. Existing selections are kept.",
+        "Select all growing causes",
+        disabled=not growing_causes,
+        help="Adds direct causes with increasing age curves, including slowing and bounded growth. Existing selections are kept.",
     ):
         st.session_state[INTERVENTION_CAUSES_KEY] = sorted(
             set(st.session_state.get(INTERVENTION_CAUSES_KEY, []))
-            | {model.names[code] for code in exponential_growth}
+            | {model.names[code] for code in growing_causes}
         )
     selected = st.multiselect(
         "Causes to modify in the scenario", sorted(options), key=INTERVENTION_CAUSES_KEY
@@ -532,6 +543,12 @@ def render_simulator_tab(
             st.session_state[f"fast_rate_{code}"] = suggested_fast_rates[code]
             st.session_state[f"fast_rate_custom_{code}"] = False
     scenarios = render_interventions(selected, options, suggested_fast_rates)
+    if config.old_age_model == "individual" and any(
+        active_tails[code].curve.kind == "linked" for code in scenarios
+    ):
+        st.caption(
+            "Linked reporting categories already inherit treatment effects from their underlying causes. An intervention entered directly on a linked category is an additional multiplier."
+        )
     baseline = simulate_survival(model, initial_age, config=config)
     scenario = simulate_survival(model, initial_age, scenarios, config) if scenarios else baseline
 
@@ -687,6 +704,7 @@ def render_simulator_tab(
         },
         "historical_trends": "2011–2019" if use_trends else "disabled",
         "reference_population": "Spain, males, 2021",
+        "excluded_inapplicable_causes": INAPPLICABLE_MALE_CAUSES,
         "cause_tail_fits": {code: fit.record() for code, fit in model.tail_fits.items()},
     }
     st.download_button(
@@ -707,15 +725,15 @@ def render_tail_overrides(
     with st.expander("Override individual cause trajectories"):
         st.caption(
             "Optional scenario assumptions. Overrides also appear in Cause trajectories and exports. "
-            "Their validation scores are cleared because they are no longer the automatic fit."
+            "These are scenario choices, not validated extreme-age predictions."
         )
         dementia = fitted.get(DEMENTIA_CODE)
         if dementia is not None and dementia.alternative_curve is not None:
             choice = st.radio(
                 "Dementia age trajectory",
-                ["Exponent fitted at 70–89 (default)", "Sigmoid fitted at 70–94 (comparison)"],
+                ["Slowing growth (reviewed default)", "Sigmoid fitted at 70–94 (comparison)"],
                 disabled=not enabled,
-                help="The default extrapolates the younger-age trend. The sigmoid tests a saturation assumption.",
+                help="The default uses a nearby slope and an assumed slowdown timescale. The sigmoid tests a saturation assumption.",
             )
             if enabled and choice.startswith("Sigmoid"):
                 active[DEMENTIA_CODE] = replace(
@@ -731,22 +749,29 @@ def render_tail_overrides(
                     alternative_log_rmse=None,
                 )
         options = cause_options(frame)
+        custom_key = "custom_cause_trajectories_v2"
+        if custom_key in st.session_state:
+            st.session_state[custom_key] = [
+                name for name in st.session_state[custom_key] if name in options
+            ]
         selected = st.multiselect(
             "Causes with custom age trajectories",
             sorted(options),
             disabled=not enabled,
+            key=custom_key,
         )
         for name in selected:
             code = options[name]
             original = active[code]
-            families = ["exponent", "sigmoid", "plateau", "decline"]
-            left, middle, right = st.columns(3)
+            families = list(FAMILY_LABELS)
+            left, middle, right, extra = st.columns(4)
             family = left.selectbox(
                 f"Tail family for {name}",
                 families,
                 index=families.index(original.curve.kind),
                 key=f"tail_family_{code}_{original.curve.kind}",
                 disabled=not enabled,
+                format_func=lambda kind: FAMILY_LABELS[kind],
             )
             initial_curve = original.curve
             if original.alternative_curve is not None and original.alternative_curve.kind == family:
@@ -759,8 +784,8 @@ def render_tail_overrides(
                 value=float(initial_curve.slope),
                 step=0.01,
                 key=f"tail_slope_{parameter_key}",
-                disabled=not enabled or family == "plateau",
-                help="Exponent/decline: logarithmic rate change per year. Sigmoid: logistic shape slope.",
+                disabled=not enabled or family in {"plateau", "linked"},
+                help="Slowing/bounded growth: initial log-slope at 94. Exponent/decline: exponential parameter. Sigmoid: logistic slope.",
             )
             ratio = right.number_input(
                 f"Plateau / age-94 rate for {name}",
@@ -773,13 +798,32 @@ def render_tail_overrides(
                 key=f"tail_plateau_{parameter_key}",
                 disabled=not enabled or family != "sigmoid",
             )
+            slowdown = extra.number_input(
+                f"Slowdown years for {name}",
+                min_value=1.0,
+                max_value=200.0,
+                value=float(initial_curve.slowdown_years),
+                step=5.0,
+                key=f"tail_slowdown_{parameter_key}",
+                disabled=not enabled or family not in {"power", "bounded"},
+                help="An assumed timescale, not a fitted estimate. Larger values sustain growth for longer.",
+            )
+            linked_group = None
+            if family == "linked":
+                linked_group = st.selectbox(
+                    f"Reference group for {name}",
+                    ["natural", "external"],
+                    index=1 if original.curve.linked_group == "external" else 0,
+                    key=f"tail_linked_{parameter_key}",
+                    disabled=not enabled,
+                )
             if enabled:
                 active[code] = replace(
                     original,
-                    curve=TailCurve(family, slope, ratio),
+                    curve=TailCurve(family, slope, ratio, slowdown, linked_group),
                     fit_ages="manual",
                     status="Manual override",
-                    reason="User-specified tail shape; not selected by validation.",
+                    reason="User-specified shape and parameters; the reviewed rationale below describes the default, not this override.",
                     validation_log_rmse=None,
                     year_agreement=None,
                     alternative=original.curve.kind,
@@ -914,26 +958,55 @@ def render_trajectories_tab(
 ) -> None:
     st.subheader("Individual late-age trajectories")
     st.caption(
-        "Shapes use 2011–2019; levels use 2021. Exponent, sigmoid, plateau and decline "
-        "are spliced continuously at age 94. Dementia defaults to an exponent fitted at 70–89; "
-        "its 70–94 sigmoid is a comparison. All 95+ observations are excluded."
+        "Inspect the description, reasoning and curve for each of the 65 retained causes. "
+        "Families are scenario assumptions; slopes use pre-pandemic observations and levels use 2021."
     )
     names = cause_names_by_code(frame)
-    table = tail_fit_table(tails, names)
+    table = tail_fit_table(tails, names, config.decline_residual_fraction)
     counts = table.Family.value_counts()
     st.write(
         " · ".join(
-            f"{kind.title()}: {counts.get(kind, 0)}"
-            for kind in ("exponent", "sigmoid", "plateau", "decline")
+            f"{FAMILY_LABELS[kind]}: {counts[kind]}"
+            for kind in FAMILY_LABELS
+            if counts.get(kind, 0)
         )
     )
-    st.dataframe(table.drop(columns=["Reason"]), hide_index=True)
-    st.download_button(
-        "Download cause trajectory fits CSV",
-        table.to_csv(index=False),
-        "cause_trajectory_fits.csv",
-        "text/csv",
+    st.caption(
+        "Default slowdown: 20 years (editable per cause). Declining residual: 25% by default (editable in Mortality assumptions). Neither is an estimated biological constant."
     )
+    with st.expander("All 65 causes: descriptions and parameters"):
+        st.caption(
+            "Cervical, other uterine and ovarian cancer are excluded from this male population because all source rates are zero. Male breast cancer and rare congenital/perinatal sequelae remain. All 95+ observations are excluded from fitting."
+        )
+        st.dataframe(
+            table.drop(columns=["Reason"]),
+            hide_index=True,
+            column_order=[
+                "Cause",
+                "Model",
+                "Description",
+                "Why this model",
+                "Status",
+                "Family",
+                "Slope (1/year)",
+                "Slowdown (years, assumed)",
+                "Declining residual (assumed)",
+                "Linked group",
+                "Age window",
+                "History",
+                "Sigmoid plateau / age-94 rate",
+                "Bounded plateau / age-94 rate (assumed)",
+                "Alternative",
+                "Alternative age window",
+                "Alternative log-RMSE",
+            ],
+        )
+        st.download_button(
+            "Download cause trajectory fits CSV",
+            table.to_csv(index=False),
+            "cause_trajectory_fits.csv",
+            "text/csv",
+        )
     options = cause_options(frame)
     ordered_names = sorted(options)
     cause_name = st.selectbox(
@@ -943,7 +1016,40 @@ def render_trajectories_tab(
     )
     code = options[cause_name]
     fit = tails[code]
+    st.markdown(f"**About this cause.** {fit.description}")
+    st.markdown(f"**Why the reviewed model was chosen.** {fit.rationale}")
     st.info(f"{fit.status}: {fit.reason}")
+    formulas = {
+        "power": r"h(a)=h_{94}(1+x/\tau)^{b\tau}",
+        "bounded": r"h(a)=h_{94}\exp[b\tau(1-e^{-x/\tau})]",
+        "plateau": r"h(a)=h_{94}",
+        "decline": r"h(a)=h_{94}[r+(1-r)e^{-dx}]",
+        "linked": r"h_i(a,t)=\rho_i(a)\sum_{j\in G}h_j(a,t)",
+        "exponent": r"h(a)=h_{94}e^{bx}",
+        "sigmoid": r"h(a)=h_{94}\frac{R}{1+(R-1)e^{-bx}}",
+    }
+    st.latex(formulas[fit.curve.kind])
+    if fit.curve.kind in {"power", "bounded"}:
+        st.caption(
+            f"x = age − 94; b = {fit.curve.slope:.5f}/year; τ = {fit.curve.slowdown_years:g} years (assumed). "
+            + (
+                "The rate keeps increasing without a ceiling."
+                if fit.curve.kind == "power"
+                else f"The assumed plateau is {np.exp(fit.curve.slope * fit.curve.slowdown_years):.2f} × the age-94 rate."
+            )
+        )
+    elif fit.curve.kind == "decline":
+        st.caption(
+            f"x = age − 94; d = {fit.curve.slope:.5f}/year; r = {config.decline_residual_fraction:.0%} (assumed)."
+        )
+    elif fit.curve.kind == "linked":
+        st.caption(
+            f"Reference group: identified {fit.curve.linked_group} causes. The 2021 reporting ratio varies by age through 94, then stays fixed. Donor treatment and calendar effects carry through; an explicit intervention here adds another multiplier."
+        )
+    else:
+        st.caption(
+            "x = age − 94. The curve describes a rate among living people, not disease prevalence."
+        )
     left, right = st.columns(2)
     horizon = left.slider("Trajectory display end age", 100, 300, 140, 10)
     logarithmic = right.checkbox("Logarithmic mortality scale", value=True)
@@ -953,6 +1059,7 @@ def render_trajectories_tab(
         trend_horizon_years=0,
         pandemic=PandemicConfig(mode="hold_2021"),
         decline_residual_fraction=config.decline_residual_fraction,
+        old_age_slope_multiplier=config.old_age_slope_multiplier,
     )
     ages = np.arange(70, horizon + 1)
     rates = model.rates(ages, np.full(len(ages), 2021), settings)[:, model.codes.index(code)]
@@ -983,12 +1090,11 @@ def render_trajectories_tab(
         figure.add_scatter(x=ages[mask], y=rates[mask], name=label, line={"dash": dash})
     if fit.alternative_curve is not None:
         tail_ages = ages[ages >= 94]
-        anchor_rate = rates[ages == 94][0]
-        alternative_rates = anchor_rate * np.exp(
-            fit.alternative_curve.log_multiplier(
-                tail_ages - 94, decline_residual=config.decline_residual_fraction
-            )
-        )
+        comparison_tails = {**tails, code: replace(fit, curve=fit.alternative_curve)}
+        comparison_model = MortalityModel(frame, tail_fits=comparison_tails)
+        alternative_rates = comparison_model.rates(
+            tail_ages, np.full(len(tail_ages), 2021), settings
+        )[:, comparison_model.codes.index(code)]
         figure.add_scatter(
             x=tail_ages,
             y=alternative_rates,
@@ -1012,16 +1118,20 @@ def render_trajectories_tab(
         "and shows uncalibrated cause rates so they can be compared with the observations. "
         f"Declining tails retain the selected residual share: {config.decline_residual_fraction:.0%}."
     )
-    with st.expander("How the first-version selection works"):
+    with st.expander("How these assumptions work"):
         st.markdown(
-            "Positive, sufficiently large series are compared by predicting the next closed age group: "
-            "70–84 → 85–89, then 70–89 → 90–94, separately for 2011–2019. "
-            "Scores are mean year-wise log-RMSE, not confidence intervals. Near ties favour simpler forms. "
-            "Sigmoid selection requires a material improvement and support in at least two thirds of years. "
-            "A repeated decline from 85–89 to 90–94 uses that terminal branch; it has no independent "
-            "older closed group for validation. Rare/zero series and COVID receive explicit plateau fallbacks. "
-            "Dementia is an explicit exception: its default exponent uses 70–89, with no selection score; "
-            "a sigmoid using 70–94 remains available as a comparison. "
-            "No death counts or exposures are available, so these are descriptive fits. "
-            "Neither sigmoid saturation levels nor centuries-long extrapolations are empirically validated."
+            "The family for each cause is a reviewed working assumption, not a model-selection winner. "
+            "Initial growth slopes use log-linear fits to mean rates in the three closed groups 80–94 "
+            "during 2011–2019. Sparse growth slopes use 25% own-profile slope and 75% supported group median; "
+            "COVID borrows the infection median. With no supported group, 0.05/year is an explicit fallback. "
+            "Declining slopes use 85–94, adjusted to match the initial decline with the default 25% residual. "
+            "A shared 20-year slowdown is a starting assumption and can be changed per cause. "
+            "Bounded growth requires episode frequency and severity to stabilize; a bounded probability alone "
+            "does not bound a hazard. Flat positive risk continues accumulating deaths. "
+            "Linked codes use identified natural or external causes, excluding all reporting categories from their donors. "
+            "Their own historical trend is replaced by donor trends. They preserve 2021 observations, and inherit "
+            "changes to donor mortality without renormalizing other causes. "
+            "Sparse series and broad mixtures are marked provisional. No probabilities are assigned to these choices. "
+            "The dementia sigmoid remains a descriptive comparison; its score concerns predictions below 95 only. "
+            "Future treatments may change survivor selection, so present-day age patterns may not transfer to extended lifespans."
         )

@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from lifespan_simulator.cause_models import CAUSE_ASSUMPTIONS, LINKED_CAUSES
 from lifespan_simulator.config import PandemicConfig, ProjectionConfig
 from lifespan_simulator.data import (
     DEMENTIA_CODE,
@@ -50,7 +51,7 @@ def test_merge_preserves_every_year_age_total_and_precedes_time_fits(inputs):
     raw, frame, _ = inputs
     merged = merge_dementia(raw)
     assert not set(merged.cause_code) & DEMENTIA_COMPONENTS
-    assert frame.cause_code.nunique() == 68
+    assert frame.cause_code.nunique() == 65
     np.testing.assert_allclose(
         merged.groupby(["year", "age_start"]).rate.sum(),
         raw.groupby(["year", "age_start"]).rate.sum(),
@@ -79,34 +80,28 @@ def test_shape_selection_does_not_use_pandemic_or_open_age_rates(inputs, model):
     assert fit_cause_tails(changed, model.codes) == model.tail_fits
     assert model.tail_fits["C33_C34"].curve.kind == "decline"
     assert model.tail_fits["C33_C34"].validation_log_rmse is None
-    assert model.tail_fits["G20"].curve.kind == "sigmoid"
-    assert model.tail_fits["B20-B24"].status == "Fallback"
-    assert model.tail_fits["U071"].status == "Fallback"
+    assert model.tail_fits["G20"].curve.kind == "power"
+    assert model.tail_fits["B20-B24"].status == "Provisional assumption"
+    assert model.tail_fits["U071"].status == "Provisional assumption"
 
 
-def test_dementia_defaults_to_younger_exponent_and_preserves_fitted_sigmoid(inputs, model):
+def test_reviewed_dementia_uses_nearby_slope_and_preserves_comparison(inputs, model):
     fit = model.tail_fits[DEMENTIA_CODE]
-    assert fit.curve.kind == "exponent"
-    assert fit.fit_ages == "70–89"
-    assert fit.curve.slope == pytest.approx(0.1980141115)
+    assert fit.curve.kind == "power"
+    assert fit.fit_ages == "80–94"
+    assert fit.curve.slope == pytest.approx(0.1497565669)
+    assert fit.curve.slowdown_years == 20
     assert fit.status == "Scenario assumption"
     assert fit.validation_log_rmse is None and fit.year_agreement is None
     assert fit.alternative_curve.kind == "sigmoid"
     assert fit.alternative_curve.slope == pytest.approx(0.2167405741)
     assert fit.alternative_curve.asymptote_ratio == pytest.approx(1.528725466)
-    assert fit.alternative_fit_ages == "70–94"
     assert fit.alternative_log_rmse == pytest.approx(0.1165226056)
-    assert fit.record()["alternative_curve"]["kind"] == "sigmoid"
-
     raw = inputs[0]
-    # Even absent or dramatically different 90–94 observations must not set
-    # the primary slope or force a fallback for an otherwise supported 70–89 fit.
     changed = raw.copy()
-    changed.loc[changed.age_start >= 90, "rate"] *= 1000
-    assert fit_cause_tails(changed, [DEMENTIA_CODE])[DEMENTIA_CODE].curve == fit.curve
-    truncated = fit_cause_tails(raw[raw.age_start < 90], [DEMENTIA_CODE])[DEMENTIA_CODE]
-    assert truncated.curve == fit.curve
-    assert truncated.alternative_curve is None
+    changed.loc[changed.age_start == 90, "rate"] *= 2
+    assert fit_cause_tails(changed, [DEMENTIA_CODE])[DEMENTIA_CODE].curve.slope > fit.curve.slope
+    assert fit.record()["description"] and fit.record()["rationale"]
 
 
 @pytest.mark.parametrize(
@@ -143,6 +138,8 @@ def test_simple_synthetic_profiles_choose_their_family(curve):
         TailCurve("sigmoid", 0.2, 3),
         TailCurve(),
         TailCurve("decline", 0.1),
+        TailCurve("power", 0.15),
+        TailCurve("bounded", 0.15),
     ],
 )
 def test_individual_curves_splice_continuously_and_follow_their_shape(curve):
@@ -150,7 +147,7 @@ def test_individual_curves_splice_continuously_and_follow_their_shape(curve):
     ages = np.array([94, 94.000001, 95, 120, 300])
     actual = model.rates(ages, np.full(len(ages), 2021), individual_config())[:, 0]
     assert actual[1] == pytest.approx(actual[0], rel=1e-6)
-    expected = 1000 * np.exp(curve.log_multiplier(ages - 94))
+    expected = 1000 * np.exp(curve.log_multiplier(ages - 94, decline_residual=0.25))
     np.testing.assert_allclose(actual, expected)
 
 
@@ -192,12 +189,22 @@ def test_treatment_does_not_redistribute_removed_hazard_to_other_causes(model):
     treated = model.rates(ages, years, ProjectionConfig(), scenarios)
     index = model.codes.index(DEMENTIA_CODE)
     assert (treated[:, index] == 0).all()
-    np.testing.assert_array_equal(np.delete(treated, index, axis=1), np.delete(base, index, axis=1))
+    independent = [
+        i
+        for i, code in enumerate(model.codes)
+        if code != DEMENTIA_CODE and code not in LINKED_CAUSES
+    ]
+    np.testing.assert_array_equal(treated[:, independent], base[:, independent])
+    for code in ("R96-R99", "R_OTH"):
+        assert (treated[:, model.codes.index(code)] < base[:, model.codes.index(code)]).all()
+    assert (treated <= base).all()
 
 
 def test_decline_without_treatment_has_known_finite_cumulative_hazard():
     model = one_cause_model(TailCurve("decline", 0.1))
-    result = simulate_survival(model, 94, config=individual_config(max_age=200))
+    result = simulate_survival(
+        model, 94, config=individual_config(max_age=200, decline_residual_fraction=0)
+    )
     cumulative = 0.01 / (1 - exp(-0.1))
     assert result.infinite_mean
     assert result.survival_forever_lower_bound == pytest.approx(exp(-cumulative))
@@ -225,6 +232,8 @@ def test_positive_decline_residual_restores_finite_mean_and_valid_bound():
         TailCurve("sigmoid", 0.2, 10),
         TailCurve(),
         TailCurve("decline", 0.1),
+        TailCurve("power", 0.15),
+        TailCurve("bounded", 0.15),
     ],
 )
 @pytest.mark.parametrize("residual", [0.0, 0.25])
@@ -256,6 +265,10 @@ def test_adjusted_fast_defaults_reduce_exponential_hazards_by_ten_percent(model,
         trend_horizon_years=0,
         pandemic=PandemicConfig(mode="hold_2021"),
     )
+    if mode == "individual":
+        # Exponentials remain available as explicit overrides, not defaults.
+        model = one_cause_model(TailCurve("exponent", 0.15))
+        config = replace(config, calibrate=False)
     growth = model.exponential_age_growth(config)
     assert growth
     scenarios = build_scenario_map(
@@ -331,3 +344,135 @@ def test_all_cause_fast_elimination_is_zero_with_individual_tails(model):
         result = simulate_survival(model, 35, scenario, ProjectionConfig(max_age=10000))
     assert result.infinite_mean and result.survival_forever_lower_bound == 1
     assert (result.annual_projection.hazard == 0).all()
+
+
+def test_registry_covers_all_retained_causes_and_no_zero_only_cancers(inputs, model):
+    from collections import Counter
+
+    from lifespan_simulator.data import INAPPLICABLE_MALE_CAUSES
+
+    raw, frame, _ = inputs
+    assert set(model.codes) == set(CAUSE_ASSUMPTIONS)
+    assert not set(model.codes) & INAPPLICABLE_MALE_CAUSES.keys()
+    assert raw.loc[raw.cause_code.isin(INAPPLICABLE_MALE_CAUSES), "rate"].eq(0).all()
+    assert {"C50", "P", "Q"} <= set(model.codes)
+    assert Counter(f.curve.kind for f in model.tail_fits.values()) == {
+        "power": 25,
+        "bounded": 24,
+        "plateau": 10,
+        "decline": 3,
+        "linked": 3,
+    }
+    assert all(f.description and f.rationale for f in model.tail_fits.values())
+    assert all(f.validation_log_rmse is None for f in model.tail_fits.values())
+
+
+def test_covid_borrowing_and_sparse_shrinkage_are_independent_of_requested_subset(inputs, model):
+    raw = inputs[0]
+    codes = ["U071", "U072", "U_COV19_OTH", "C50"]
+    subset = fit_cause_tails(raw, codes)
+    assert all(subset[code] == model.tail_fits[code] for code in codes)
+    assert len({subset[code].curve for code in codes[:3]}) == 1
+    assert subset["C50"].curve.slope > 0
+    assert "25% own" in subset["C50"].reason
+
+
+def test_new_curve_derivatives_limits_and_parameter_validation():
+    b, tau = 0.15, 20.0
+    power = TailCurve("power", b, slowdown_years=tau)
+    bounded = TailCurve("bounded", b, slowdown_years=tau)
+    for curve in (power, bounded):
+        assert curve.log_multiplier(np.array([0.0]))[0] == 0
+        assert curve.log_multiplier(np.array([1e-6]))[0] / 1e-6 == pytest.approx(b)
+    assert power.log_multiplier(np.array([1e10]))[0] > 50
+    assert bounded.log_multiplier(np.array([1e10]))[0] == pytest.approx(b * tau)
+    for tau in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            TailCurve("power", b, slowdown_years=tau)
+    with pytest.raises(ValueError):
+        TailCurve("linked")
+    with pytest.raises(ValueError, match="underlying"):
+        TailCurve("linked", linked_group="natural").log_multiplier(np.array([1]))
+
+
+def linked_model():
+    specs = {
+        "U071": (1000.0, TailCurve("power", 0.15)),
+        "W00-W19": (200.0, TailCurve("bounded", 0.1)),
+        "R96-R99": (100.0, TailCurve("linked", linked_group="natural")),
+        "R_OTH": (50.0, TailCurve("linked", linked_group="natural")),
+        "Y10-Y34_Y872": (20.0, TailCurve("linked", linked_group="external")),
+    }
+    frame = pd.DataFrame(
+        [
+            {
+                "cause_code": code,
+                "cause_name": code,
+                "age_start": age,
+                "age_mid": age + 2,
+                "rate": rate,
+            }
+            for code, (rate, curve) in specs.items()
+            for age in range(35, 95, 5)
+        ]
+    )
+    return MortalityModel(
+        frame,
+        tail_fits={
+            code: CauseTailFit(curve, "test", "test", "test", "test")
+            for code, (_, curve) in specs.items()
+        },
+    )
+
+
+def test_linked_categories_preserve_baseline_and_follow_correct_donors():
+    model = linked_model()
+    config = individual_config()
+    ages = np.array([70.0, 94.0, 94.000001, 150.0, 200.0])
+    years = np.full(len(ages), 2021)
+    base = model.rates(ages, years, config)
+    assert base[0].sum() == pytest.approx(1370.0)
+    scenario = build_scenario_map({"U071": (2021, 0, 2021, 0.5, 0.01)})
+    changed = model.rates(ages, years, config, scenario)
+    for code in ("U071", "R96-R99", "R_OTH"):
+        idx = model.codes.index(code)
+        np.testing.assert_allclose(changed[:, idx], 0.5 * base[:, idx])
+    for code in ("W00-W19", "Y10-Y34_Y872"):
+        idx = model.codes.index(code)
+        np.testing.assert_allclose(changed[:, idx], base[:, idx])
+    assert base[2].sum() == pytest.approx(base[1].sum(), rel=1e-6)
+    # Applying a reporting-category intervention is an explicit extra multiplier.
+    scenario["R96-R99"] = build_scenario_map({"R96-R99": (2021, 0, 2021, 0.2, 0.01)})["R96-R99"]
+    extra = model.rates(ages, years, config, scenario)
+    idx = model.codes.index("R96-R99")
+    np.testing.assert_allclose(extra[:, idx], 0.8 * changed[:, idx])
+
+
+@pytest.mark.parametrize("fast", [0.00001, 0.02, 0.2])
+def test_polynomial_future_bound_handles_growth_before_eventual_treatment_decay(fast):
+    model = one_cause_model(TailCurve("power", 0.25, slowdown_years=30))
+    config = individual_config()
+    scenario = build_scenario_map({"X": (2021, 0, 2021, fast, 0.01)})
+    future = model.future_mortality(95, 2022, config, scenario)
+    ages = np.arange(95, 10001)
+    partial = model.rates(ages, 2022 + ages - 95, config, scenario).sum() / 100_000
+    assert future.infinite_mean
+    assert partial <= future.remaining_hazard_upper_bound * (1 + 1e-12)
+    assert model.future_mortality(95, 2022, config, {}).minimum_hazard > 0
+
+
+def test_linked_future_bounds_include_donor_covid_and_treatment_effects():
+    model = linked_model()
+    config = replace(individual_config(), pandemic=PandemicConfig(residual_fraction=0.1))
+    scenario = build_scenario_map(
+        {code: (2021, 0, 2021, 0.2, 0.01) for code in ("U071", "W00-W19")}
+    )
+    future = model.future_mortality(100, 2027, config, scenario)
+    ages = np.arange(100, 10001)
+    partial = model.rates(ages, 2027 + ages - 100, config, scenario).sum() / 100_000
+    assert future.infinite_mean
+    assert partial <= future.remaining_hazard_upper_bound * (1 + 1e-12)
+    assert future.remaining_hazard_upper_bound < float("inf")
+    untreated = model.future_mortality(100, 2027, config, {})
+    rates = model.rates(ages, 2027 + ages - 100, config).sum(axis=1) / 100_000
+    assert 0 < untreated.minimum_hazard <= rates.min()

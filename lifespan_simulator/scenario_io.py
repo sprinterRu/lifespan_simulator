@@ -6,7 +6,7 @@ from math import isfinite
 
 import pandas as pd
 
-from .data import DEMENTIA_NAME
+from .data import DEMENTIA_NAME, INAPPLICABLE_MALE_CAUSES
 from .interventions import ScenarioMap
 
 ACTIVE_INTERVENTION_COLUMNS = (
@@ -67,6 +67,10 @@ def parse_interventions_csv(
 
     for row_number, row in enumerate(frame.to_dict(orient="records"), start=2):
         cause_name = str(row["Cause"]).strip()
+        if cause_name in INAPPLICABLE_MALE_CAUSES.values():
+            raise ValueError(
+                f"Cause on row {row_number} was removed from this male model: {cause_name}. Remove that CSV row before importing."
+            )
         if cause_name not in all_cause_options:
             raise ValueError(f"Unknown cause on row {row_number}: {cause_name}.")
         if cause_name in cause_names:
