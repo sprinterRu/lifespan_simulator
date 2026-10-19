@@ -22,7 +22,7 @@ uv run ruff format --check .
 ## What is included
 
 - **Simulator:** selectable cohort starting year and age; historical trends; a separate COVID path; two-stage interventions; survival curves, life expectancy and death-age percentiles.
-- **Cause trajectories:** individual exponent, sigmoid, plateau or declining tails for 68 causes; inspect fitted curves, selection scores and fallback assumptions, and export the full fit table. Dementia and Alzheimer disease are combined.
+- **Cause trajectories:** reviewed curves for 65 causes, each with a description, rationale, formula and parameter provenance. Includes slowing growth, bounded growth, flat, declining-with-residual and linked reporting categories. Export descriptions and parameters as CSV or JSON. Dementia and Alzheimer disease are combined.
 - **Reference checks:** compare the source cause totals with official all-cause rates, and reconstruct period remaining life expectancy at 35, 65, 85 and 94.
 - **Sensitivity analysis:** change COVID, old-age mortality, trend assumptions, calibration and intervention parameters one at a time; export the paired baseline/scenario results as CSV.
 - **Historical explorer:** inspect the original time series and fitted mean confidence bands, including pandemic years.
@@ -33,8 +33,9 @@ uv run ruff format --check .
 |---|---|
 | Cohort | Age 35 in 2021; starting year is configurable |
 | Baseline calibration | Match Eurostat single-age all-cause Mx at ages 35–94, preserving source cause shares |
-| Old-age mortality | Individual cause trajectories, fitted to closed groups at ages 70–94 in 2011–2019 and spliced at 94; common Kannisto, Gompertz and flat curves remain available for comparison |
-| Declining tails | Exponential decline toward zero; an optional residual share tests continued background risk |
+| Old-age mortality | Reviewed cause-specific families after 94; initial growth slopes use 80–94 in 2011–2019. Common Kannisto, Gompertz and flat curves remain available for comparison |
+| Growth slowdown | 20 years, an explicit assumption editable per cause |
+| Declining tails | Decline toward 25% of the age-94 rate; the residual is an editable assumption, not a treatment floor |
 | Historical trends | Significant linear cause-age slopes from 2011–2019; COVID excluded |
 | Trend bounds | 15% to 2× the age-specific baseline; extrapolate for 50 years after 2021, then hold time factors fixed |
 | COVID | Fade from its 2021 rate with a 3-year half-life toward a 10% residual share |
@@ -45,13 +46,17 @@ COVID fade, trend bounds/horizon and intervention values are **scenario assumpti
 
 **All 95+ observations are excluded** from the simulator, age-curve fits, historical trends, calibration and reference comparisons, including the legacy modes. The last closed cause group is 90–94. The raw source files are unchanged. Beyond 94, cause rates are extrapolated without renormalizing their sum to a common age curve.
 
-The first-version selector prefers simple forms on near ties and labels weak evidence explicitly. Fourteen sparse or unavailable series use plateau fallbacks; this is not evidence of a measured biological plateau. Each cause's family and parameters can be changed under **Override individual cause trajectories**. Overrides appear in the trajectory table and assumptions JSON with their validation score cleared. Details and limitations are in [the model description](docs/model.md).
+The reviewed registry contains **25 slowing-growth, 24 bounded-growth, 10 flat, 3 declining and 3 linked categories**. Families are judgment-based scenario priors, not statistical winners or validated predictions at extreme ages. Initial slopes are estimated near the boundary; sparse slopes borrow from supported groups. Slowdown timescales and residuals are explicitly assumed. See [model equations and limitations](docs/model.md).
 
-Dementia is an explicit scenario choice: its default is an exponent fitted to ages **70–89**, with a log-slope of about 0.198/year (doubling in 3.50 years). The previous sigmoid fitted to 70–94 remains available through **Dementia age trajectory** inside the override expander. Both curves appear in the inspection chart. The primary slope excludes 90–94; the common age-94 anchor still uses the baseline source level and optional calibration. No automatic selection score is assigned to the chosen exponent.
+Cervical (`C53`), other uterine (`C54_C55`) and ovarian (`C56`) cancers are removed from this male model and its selection controls. All their source observations are zero. Male breast cancer, congenital conditions and rare perinatal sequelae remain included. Raw CSV data are unchanged. Importing an intervention for a removed category produces an explanatory error rather than silently dropping a row.
 
-For an active exponential log-slope `b`, the suggested fast reduction is `1 - 0.9 * exp(-b)`, so age growth and treatment together multiply the hazard by 0.9 each year. Dementia therefore defaults to **26.167755%**, rather than a raw 10% reduction. The net target applies after 94 with fixed calendar factors; it does not compensate ongoing time trends or changing COVID levels. Non-exponential families retain a raw 10% default. Common Gompertz mode uses its shared slope for all causes.
+Dementia defaults to **slowing growth**, with initial log-slope about **0.149757/year**, estimated over 80–94, and an assumed 20-year slowdown. The earlier 70–94 sigmoid remains available through **Dementia age trajectory** as a comparison. A bounded disease prevalence does not imply bounded mortality.
 
-**Select all exponentially growing causes** adds the active positive-slope exponent causes to the selection (38 with current defaults), preserving existing selections. Automatic fast values follow trajectory changes until edited. Manual values and CSV imports are preserved; **Reset selected fast rates to defaults** explicitly applies the current suggestions to selected causes. Existing sessions without provenance tracking retain their saved values until reset. Exports store actual treatment reductions with the same CSV semantics as before.
+Unknown/ill-defined causes and other symptoms follow identified natural causes; undetermined intent follows identified external causes. Reporting ratios use 2021 rates by age, then stay fixed after 94. Donor calendar, COVID and treatment effects carry through; the reporting categories' own historical slopes are not used in individual mode. A direct intervention on a linked category is an explicit additional multiplier.
+
+All reviewed families default to a **raw 10% fast treatment reduction**. Explicit exponential overrides retain the previous suggestion `1 - 0.9 * exp(-b)`, giving a 10% net annual decrease under fixed calendar factors. Common Gompertz uses its shared exponential slope. Manual values and imported CSV settings retain their literal reductions.
+
+**Select all growing causes** adds the 49 direct increasing causes under current defaults, preserving existing selections. It includes slowing and bounded growth. **Reset selected fast rates to defaults** explicitly applies current suggestions. Each family and its parameters, including the slowdown timescale, can be changed under **Override individual cause trajectories**. Assumptions JSON records actual interventions, active curves and the excluded categories.
 
 ## Reading the results
 
@@ -100,7 +105,8 @@ New exports use `Dementia including Alzheimer disease`. Two legacy dementia/Alzh
 - `app.py`: entry point, cached inputs and tabs.
 - `data.py`: source normalization, validation and reference loading.
 - `config.py`: validated, immutable projection assumptions.
-- `tails.py`: compact cause-curve families, pre-pandemic shape selection and fit diagnostics.
+- `cause_models.py`: reviewed family, description, rationale and provisional status for every retained cause.
+- `tails.py`: curve equations, nearby slope estimation, pooling and descriptive comparisons.
 - `mortality.py`: reusable age/cause surface, calibration, pandemic path and old-age curves.
 - `interventions.py` / `scenario_io.py`: intervention paths and CSV interchange.
 - `simulation.py`: analytical within-year survival, life-year integration and numerical remainder bounds.
@@ -135,4 +141,4 @@ result = simulate_survival(model, initial_age=35, config=ProjectionConfig(start_
 
 Projection functions accept `MortalityModel` and `ProjectionConfig`. Full mean fields are finite numbers when numerically converged, `None` when unresolved, or `math.inf` when infinity has been established analytically. `converged` identifies finite numerical convergence; `mean_resolved` includes analytically infinite means; `infinite_mean` distinguishes them. Use `restricted_remaining_life_expectancy`, `survival_at_end`, `remaining_expectation_bound` and `survival_forever_lower_bound` for diagnostics. Export the UI's assumptions JSON alongside sensitivity CSVs to record the chosen settings.
 
-Supply `tail_fits` when constructing the default individual model. Without pre-pandemic history, a 2021-only frame produces explicitly marked plateau fallbacks.
+Supply `tail_fits` when constructing the default individual model. Without pre-pandemic history, the reviewed families remain in place; unsupported growth slopes use an explicitly labelled 0.05/year prior. Supply the historical fits for the intended defaults.

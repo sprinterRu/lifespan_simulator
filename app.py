@@ -44,7 +44,7 @@ def main() -> None:
         REFERENCE_DIR / "spain_male_2021_all_causes.csv",
         *(
             DATA_PATH.parent / "lifespan_simulator" / file
-            for file in ("data.py", "tails.py", "trends.py")
+            for file in ("data.py", "tails.py", "trends.py", "cause_models.py", "config.py")
         ),
     )
     raw, simulator, official, trends, tails = load_inputs(

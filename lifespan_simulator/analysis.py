@@ -7,7 +7,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
-from .config import PandemicConfig, ProjectionConfig
+from .config import DECLINE_RESIDUAL_DEFAULT, PandemicConfig, ProjectionConfig
 from .interventions import ScenarioMap, build_scenario_map
 from .mortality import MortalityModel
 from .simulation import simulate_survival
@@ -37,7 +37,7 @@ def compare_life_expectancy(
     frame: pd.DataFrame,
     official: pd.DataFrame,
     tail_fits: dict[str, CauseTailFit] | None = None,
-    decline_residual_fraction: float = 0,
+    decline_residual_fraction: float = DECLINE_RESIDUAL_DEFAULT,
 ) -> pd.DataFrame:
     """Compare period e(x) with no secular trend and the observed pandemic level.
 
@@ -101,7 +101,7 @@ def sensitivity_variants(
             )
         )
     if config.old_age_model == "individual":
-        for residual in (0.0, 0.25):
+        for residual in (0.0, 0.5):
             if residual != config.decline_residual_fraction:
                 variants.append(
                     (

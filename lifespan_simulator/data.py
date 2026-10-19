@@ -13,10 +13,19 @@ REFERENCE_DIR = DATA_PATH.parent / "data"
 DEMENTIA_CODE = "F01_F03_G30"
 DEMENTIA_NAME = "Dementia including Alzheimer disease"
 DEMENTIA_COMPONENTS = frozenset({"F01_F03", "G30"})
+INAPPLICABLE_MALE_CAUSES = {
+    "C53": "Malignant neoplasm of cervix uteri",
+    "C54_C55": "Malignant neoplasm of other parts of uterus",
+    "C56": "Malignant neoplasm of ovary",
+}
 
 # The source mixes mutually exclusive causes with overlapping roll-ups.
 # These roll-ups are excluded from the simulator totals to avoid double-counting.
 SIMULATOR_EXCLUDED_CAUSES = {
+    **{
+        code: "Absent from this male dataset (zero across all observations)."
+        for code in INAPPLICABLE_MALE_CAUSES
+    },
     "ACC": "Aggregate accidents bucket overlaps with transport, falls, drowning, poisoning and accident remainder series.",
     "B180-B182": "Subset of viral hepatitis; parent viral hepatitis series is retained instead.",
     "G_H": "Aggregate nervous-system bucket overlaps with Parkinson, Alzheimer and remainder series.",

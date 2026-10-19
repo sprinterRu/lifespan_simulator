@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 
+from .cause_models import EXTERNAL_CAUSES, LINKED_CAUSES
 from .config import BASE_YEAR, COVID_CODES, RATE_SCALE, PandemicConfig, ProjectionConfig
 from .interventions import ScenarioMap, log_intervention_multiplier
 from .tails import (
@@ -26,6 +27,16 @@ class FutureMortality:
     remaining_hazard_upper_bound: float = float("inf")
 
 
+@dataclass(frozen=True)
+class _FutureTerm:
+    index: int
+    log_rate: float
+    growth: float = 0.0
+    upper_factor: float = 0.0
+    power: float = 0.0
+    power_scale: float = 1.0
+
+
 def _log_nonnegative(values: np.ndarray | float) -> np.ndarray:
     """Represent zero rates/multipliers as -inf without logarithm warnings."""
     values = np.asarray(values, dtype=float)
@@ -36,8 +47,8 @@ class MortalityModel:
     """Prepare interpolation arrays once, then share them across scenarios.
 
     Calibration preserves interpolated cause shares and replaces their summed
-    2021 rate with official single-age Mx. Individual tails splice at 94 and
-    subsequently evolve independently. Legacy common curves remain available
+    2021 rate with official single-age Mx. Direct tails splice at 94; reporting
+    categories follow identified natural or external causes. Legacy common curves remain available
     for comparison. No separate 'old age' cause is added.
     """
 
@@ -68,6 +79,17 @@ class MortalityModel:
         )
         if set(self.tail_fits) != set(self.codes):
             raise ValueError("Tail fits must cover exactly the model's causes")
+        self.linked_donors = {}
+        for index, code in enumerate(self.codes):
+            curve = self.tail_fits[code].curve
+            if curve.kind == "linked":
+                self.linked_donors[index] = [
+                    j
+                    for j, donor in enumerate(self.codes)
+                    if donor not in LINKED_CAUSES
+                    and self.tail_fits[donor].curve.kind != "linked"
+                    and (donor in EXTERNAL_CAUSES) == (curve.linked_group == "external")
+                ]
         self.covid_mask = np.array([code in COVID_CODES for code in self.codes])
         self._points = []
         self._slopes = []
@@ -104,6 +126,20 @@ class MortalityModel:
                 for points, slopes in zip(self._points, self._slopes, strict=True)
             ]
         )
+
+    def _linked_log_ratios(self, raw: np.ndarray) -> dict[int, np.ndarray]:
+        """Observed reporting/identified ratios; no linked category is a donor."""
+        ratios = {}
+        for index, donors in self.linked_donors.items():
+            denominator = raw[:, donors].sum(axis=1)
+            if ((denominator == 0) & (raw[:, index] > 0)).any():
+                raise ValueError(
+                    f"Linked cause {self.codes[index]} has no positive reference group"
+                )
+            ratios[index] = _log_nonnegative(
+                np.divide(raw[:, index], denominator, out=np.zeros(len(raw)), where=denominator > 0)
+            )
+        return ratios
 
     def _observed_total(self, ages: np.ndarray, calibrate: bool) -> np.ndarray:
         if calibrate:
@@ -145,6 +181,24 @@ class MortalityModel:
             slope = self.old_age_fit(config)["gompertz_slope"] * config.old_age_slope_multiplier
             return dict.fromkeys(self.codes, slope) if slope > 0 else {}
         return {}
+
+    def growing_causes(self, config: ProjectionConfig) -> set[str]:
+        """Direct growing hazards, excluding reporting categories and flat curves."""
+        if config.old_age_model == "individual":
+            return {
+                code
+                for code, fit in self.tail_fits.items()
+                if fit.curve.kind in {"power", "bounded", "exponent", "sigmoid"}
+                and fit.curve.slope > 0
+                and (fit.curve.kind != "sigmoid" or fit.curve.asymptote_ratio > 1)
+            }
+        if config.old_age_model in {"gompertz", "kannisto"}:
+            return (
+                set(self.codes)
+                if self.old_age_fit(config)[config.old_age_model + "_slope"] > 0
+                else set()
+            )
+        return set()
 
     def baseline_total(self, ages: np.ndarray, config: ProjectionConfig) -> np.ndarray:
         with np.errstate(over="ignore"):
@@ -216,6 +270,8 @@ class MortalityModel:
         if individual:
             distance = np.maximum(ages - TAIL_ANCHOR_AGE, 0)
             for index, code in enumerate(self.codes):
+                if index in self.linked_donors:
+                    continue
                 log_rates[:, index] += self.tail_fits[code].curve.log_multiplier(
                     distance, config.old_age_slope_multiplier, config.decline_residual_fraction
                 )
@@ -234,7 +290,16 @@ class MortalityModel:
         for code, intervention in (scenarios or {}).items():
             if code not in self.codes:
                 raise ValueError(f"Unknown intervention cause: {code}")
-            log_rates[:, self.codes.index(code)] += log_intervention_multiplier(years, intervention)
+            index = self.codes.index(code)
+            if not individual or index not in self.linked_donors:
+                log_rates[:, index] += log_intervention_multiplier(years, intervention)
+        if individual:
+            for index, ratio in self._linked_log_ratios(raw).items():
+                donors = self.linked_donors[index]
+                log_rates[:, index] = ratio + np.logaddexp.reduce(log_rates[:, donors], axis=1)
+                intervention = (scenarios or {}).get(self.codes[index])
+                if intervention is not None:
+                    log_rates[:, index] += log_intervention_multiplier(years, intervention)
         return log_rates
 
     def future_hazard_lower_bound(
@@ -247,7 +312,7 @@ class MortalityModel:
     ) -> FutureMortality:
         """Bound the tail after trends and intervention stage transitions finish.
 
-        Age curves supply constant, exponential or bounded sigmoid terms;
+        Age curves supply constant, exponential, polynomial or bounded terms;
         decline-to-residual curves split into constant and decreasing terms.
         Every remaining term decaying geometrically implies finite cumulative
         future hazard, positive limiting survival, and an infinite full mean.
@@ -268,22 +333,21 @@ class MortalityModel:
             fixed_pandemic,
             scenarios,
         )[0] - np.log(RATE_SCALE)
-        # Represent each tail by non-negative terms. For a sigmoid, current
-        # hazard is a lower bound and its asymptote supplies an upper envelope.
-        # Decline-to-residual tails split into constant and decreasing components.
-        log_terms, term_growth, upper_factors = [], [], []
-        for index, log_rate, growth, upper_factor in self._future_age_terms(
-            log_rates, anchor_age, config
-        ):
-            if not np.isfinite(log_rate):
+        # Split direct causes first, then propagate each donor term into linked
+        # reporting categories. This carries donor treatment and COVID decay into
+        # their bounds without assigning the reporting code an independent slope.
+        terms = []
+        for term in self._future_age_terms(log_rates, anchor_age, config):
+            if not np.isfinite(term.log_rate):
                 continue
-            intervention = scenarios.get(self.codes[index])
+            intervention = scenarios.get(self.codes[term.index])
+            growth = term.growth
             if intervention is not None:
                 growth += (
                     np.log1p(-intervention.fast_rate) if intervention.fast_rate < 1 else -np.inf
                 )
             pandemic_terms = [(0.0, 0.0)]
-            if self.covid_mask[index]:
+            if self.covid_mask[term.index]:
                 pandemic = config.pandemic
                 if pandemic.mode == "exclude":
                     pandemic_terms = []
@@ -298,12 +362,39 @@ class MortalityModel:
                             (np.log1p(-residual) + decay * (anchor_year - BASE_YEAR), decay)
                         )
             for log_multiplier, pandemic_growth in pandemic_terms:
-                log_terms.append(log_rate + log_multiplier)
-                term_growth.append(growth + pandemic_growth)
-                upper_factors.append(upper_factor)
-        log_terms = np.array(log_terms)
-        term_growth = np.array(term_growth)
-        upper_factors = np.array(upper_factors)
+                terms.append(
+                    replace(
+                        term,
+                        log_rate=term.log_rate + log_multiplier,
+                        growth=growth + pandemic_growth,
+                    )
+                )
+        if config.old_age_model == "individual":
+            direct_terms = list(terms)
+            raw = self._raw_rates(np.array([LAST_CLOSED_MIDPOINT]))
+            for index, ratios in self._linked_log_ratios(raw).items():
+                ratio = float(ratios[0])
+                extra_growth = 0.0
+                intervention = scenarios.get(self.codes[index])
+                if intervention is not None:
+                    ratio += float(
+                        log_intervention_multiplier(np.array([anchor_year]), intervention)[0]
+                    )
+                    extra_growth = (
+                        np.log1p(-intervention.fast_rate) if intervention.fast_rate < 1 else -np.inf
+                    )
+                if not np.isfinite(ratio):
+                    continue
+                for term in direct_terms:
+                    if term.index in self.linked_donors[index]:
+                        terms.append(
+                            replace(
+                                term,
+                                index=index,
+                                log_rate=term.log_rate + ratio,
+                                growth=term.growth + extra_growth,
+                            )
+                        )
 
         prefix_min, prefix_sum = float("inf"), 0.0
         if anchor_age > age:
@@ -314,24 +405,34 @@ class MortalityModel:
                     / RATE_SCALE
                 )
                 prefix_min, prefix_sum = float(prefix.min()), float(prefix.sum())
-        non_decaying = term_growth >= 0
+        non_decaying = [term for term in terms if term.growth >= 0]
         with np.errstate(over="ignore"):
-            if non_decaying.any():
-                lower = float(np.exp(np.logaddexp.reduce(log_terms[non_decaying])))
+            if non_decaying:
+                lower = float(np.exp(np.logaddexp.reduce([term.log_rate for term in non_decaying])))
                 return FutureMortality(min(prefix_min, lower), infinite_mean=False)
-
-            if not len(log_terms):
+            if not terms:
                 return FutureMortality(
                     0.0, infinite_mean=True, remaining_hazard_upper_bound=prefix_sum
                 )
-            log_sums = log_terms + upper_factors - np.log(-np.expm1(term_growth))
+            log_sums = []
+            for term in terms:
+                growth, envelope = term.growth, term.upper_factor
+                if term.power > 0 and np.isfinite(growth):
+                    # Bound (1+n/s)^p by exp(epsilon*n+C), with epsilon
+                    # small enough to leave geometric decay. Maximize the
+                    # concave difference analytically over all n >= 0.
+                    epsilon = min(-growth / 2, term.power / term.power_scale)
+                    peak = max(0.0, term.power / epsilon - term.power_scale)
+                    envelope += term.power * np.log1p(peak / term.power_scale) - epsilon * peak
+                    growth += epsilon
+                log_sums.append(term.log_rate + envelope - np.log(-np.expm1(growth)))
             upper = prefix_sum + float(np.exp(np.logaddexp.reduce(log_sums)))
             return FutureMortality(0.0, infinite_mean=True, remaining_hazard_upper_bound=upper)
 
     def _future_age_terms(
         self, log_rates: np.ndarray, anchor_age: int, config: ProjectionConfig
-    ) -> list[tuple[int, float, float, float]]:
-        """Return (cause index, log current rate, growth, log upper envelope)."""
+    ) -> list[_FutureTerm]:
+        """Nonnegative direct-cause terms with geometric/polynomial envelopes."""
         if config.old_age_model != "individual":
             growth = (
                 self.old_age_fit(config)["gompertz_slope"] * config.old_age_slope_multiplier
@@ -343,34 +444,52 @@ class MortalityModel:
                 if config.old_age_model == "kannisto"
                 else 0.0
             )
-            return [(i, float(rate), growth, upper) for i, rate in enumerate(log_rates)]
+            return [_FutureTerm(i, float(rate), growth, upper) for i, rate in enumerate(log_rates)]
         terms = []
         distance = anchor_age - TAIL_ANCHOR_AGE
         for index, code in enumerate(self.codes):
             curve = self.tail_fits[code].curve
+            if curve.kind == "linked":
+                continue
             rate = float(log_rates[index])
             slope = curve.slope * config.old_age_slope_multiplier
             if curve.kind == "exponent":
-                terms.append((index, rate, slope, 0.0))
+                terms.append(_FutureTerm(index, rate, slope))
             elif curve.kind == "decline":
                 residual = config.decline_residual_fraction
                 if residual == 0:
-                    terms.append((index, rate, -slope, 0.0))
+                    terms.append(_FutureTerm(index, rate, -slope))
                 else:
                     base = rate - float(
                         curve.log_multiplier(
                             np.array([distance]), config.old_age_slope_multiplier, residual
                         )[0]
                     )
-                    terms.append((index, base + np.log(residual), 0.0, 0.0))
+                    terms.append(_FutureTerm(index, base + np.log(residual)))
                     terms.append(
-                        (index, base + np.log1p(-residual) - slope * distance, -slope, 0.0)
+                        _FutureTerm(index, base + np.log1p(-residual) - slope * distance, -slope)
                     )
             elif curve.kind == "sigmoid":
                 current = float(
                     curve.log_multiplier(np.array([distance]), config.old_age_slope_multiplier)[0]
                 )
-                terms.append((index, rate, 0.0, max(0.0, np.log(curve.asymptote_ratio) - current)))
+                terms.append(
+                    _FutureTerm(
+                        index, rate, upper_factor=max(0.0, np.log(curve.asymptote_ratio) - current)
+                    )
+                )
+            elif curve.kind == "power":
+                terms.append(
+                    _FutureTerm(
+                        index,
+                        rate,
+                        power=slope * curve.slowdown_years,
+                        power_scale=curve.slowdown_years + distance,
+                    )
+                )
+            elif curve.kind == "bounded":
+                remaining = slope * curve.slowdown_years * np.exp(-distance / curve.slowdown_years)
+                terms.append(_FutureTerm(index, rate, upper_factor=remaining))
             else:
-                terms.append((index, rate, 0.0, 0.0))
+                terms.append(_FutureTerm(index, rate))
         return terms

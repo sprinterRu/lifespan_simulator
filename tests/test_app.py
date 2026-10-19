@@ -1,5 +1,3 @@
-from math import exp
-
 import pytest
 from streamlit.testing.v1 import AppTest
 
@@ -109,7 +107,7 @@ def test_individual_tail_overrides_are_visible_and_reset_to_automatic_fit():
     custom.select(DEMENTIA_NAME).run()
     next(w for w in app.selectbox if w.label == f"Tail family for {DEMENTIA_NAME}").select(
         "exponent"
-    )
+    ).run()
     next(w for w in app.number_input if w.label == f"Tail slope for {DEMENTIA_NAME}").set_value(
         0.15
     )
@@ -135,8 +133,8 @@ def test_individual_tail_overrides_are_visible_and_reset_to_automatic_fit():
 def test_dementia_comparison_switch_uses_saved_sigmoid_and_restores_default():
     app = AppTest.from_file("app.py", default_timeout=30).run()
     before = next(t.value for t in app.dataframe if "Family" in t.value.columns).set_index("Cause")
-    assert before.loc[DEMENTIA_NAME, "Family"] == "exponent"
-    assert before.loc[DEMENTIA_NAME, "Age window"] == "70–89"
+    assert before.loc[DEMENTIA_NAME, "Family"] == "power"
+    assert before.loc[DEMENTIA_NAME, "Age window"] == "80–94"
     next(w for w in app.radio if w.label == "Dementia age trajectory").set_value(
         "Sigmoid fitted at 70–94 (comparison)"
     ).run()
@@ -148,32 +146,36 @@ def test_dementia_comparison_switch_uses_saved_sigmoid_and_restores_default():
     assert row.Family == "sigmoid" and row.Status == "Comparison scenario"
     assert row["Slope (1/year)"] == pytest.approx(0.2167405741)
     assert row["Sigmoid plateau / age-94 rate"] == pytest.approx(1.528725466)
-    assert row["Alternative"] == "exponent"
+    assert row["Alternative"] == "power"
     assert (before.drop(DEMENTIA_NAME).Family == comparison.drop(DEMENTIA_NAME).Family).all()
     next(w for w in app.radio if w.label == "Dementia age trajectory").set_value(
-        "Exponent fitted at 70–89 (default)"
+        "Slowing growth (reviewed default)"
     ).run()
     assert not app.exception
     restored = next(t.value for t in app.dataframe if "Family" in t.value.columns).set_index(
         "Cause"
     )
-    assert restored.loc[DEMENTIA_NAME, "Family"] == "exponent"
+    assert restored.loc[DEMENTIA_NAME, "Family"] == "power"
     assert (
         restored.loc[DEMENTIA_NAME, "Slope (1/year)"] == before.loc[DEMENTIA_NAME, "Slope (1/year)"]
     )
 
 
-def test_select_exponential_causes_adds_active_exponents_and_keeps_previous_selection():
+def test_select_growing_causes_adds_active_growth_and_keeps_previous_selection():
     app = AppTest.from_file("app.py", default_timeout=30).run()
     lung = "Malignant neoplasm of trachea, bronchus and lung"
     next(w for w in app.multiselect if w.label == "Causes to modify in the scenario").select(
         lung
     ).run()
     table = next(t.value for t in app.dataframe if "Family" in t.value.columns)
-    expected = set(table.loc[(table.Family == "exponent") & (table["Slope (1/year)"] > 0), "Cause"])
-    next(
-        w for w in app.button if w.label == "Select all exponentially growing causes"
-    ).click().run()
+    expected = set(
+        table.loc[
+            (table.Family.isin(["power", "bounded", "exponent", "sigmoid"]))
+            & (table["Slope (1/year)"] > 0),
+            "Cause",
+        ]
+    )
+    next(w for w in app.button if w.label == "Select all growing causes").click().run()
     assert not app.exception
     selected = next(
         w for w in app.multiselect if w.label == "Causes to modify in the scenario"
@@ -183,7 +185,7 @@ def test_select_exponential_causes_adds_active_exponents_and_keeps_previous_sele
     dementia_rate = next(
         w for w in app.number_input if w.label == f"Fast annual reduction for {DEMENTIA_NAME}"
     ).value
-    assert dementia_rate == pytest.approx(1 - 0.9 * exp(-0.1980141115))
+    assert dementia_rate == pytest.approx(0.1)
     assert next(
         w for w in app.number_input if w.label == f"Fast annual reduction for {lung}"
     ).value == pytest.approx(0.1)
@@ -201,14 +203,12 @@ def test_fast_defaults_follow_shapes_but_manual_and_imported_values_are_preserve
     assert next(w for w in app.number_input if w.label == rate_label).value == pytest.approx(0.1)
     next(w for w in app.number_input if w.label == rate_label).set_value(0.4).run()
     next(w for w in app.radio if w.label == "Dementia age trajectory").set_value(
-        "Exponent fitted at 70–89 (default)"
+        "Slowing growth (reviewed default)"
     ).run()
     assert not app.exception
     assert next(w for w in app.number_input if w.label == rate_label).value == pytest.approx(0.4)
     next(w for w in app.button if w.label == "Reset selected fast rates to defaults").click().run()
-    assert next(w for w in app.number_input if w.label == rate_label).value == pytest.approx(
-        1 - 0.9 * exp(-0.1980141115)
-    )
+    assert next(w for w in app.number_input if w.label == rate_label).value == pytest.approx(0.1)
 
     # Exercise the actual CSV-to-widget seeding function before rendering.
     imported = AppTest.from_string(
@@ -232,3 +232,31 @@ main()
     assert next(w for w in imported.number_input if w.label == rate_label).value == pytest.approx(
         0.12
     )
+
+
+def test_all_causes_have_descriptions_and_irrelevant_causes_are_removed_from_controls():
+    from lifespan_simulator.data import INAPPLICABLE_MALE_CAUSES
+
+    app = AppTest.from_file("app.py", default_timeout=30).run()
+    assert not app.exception
+    table = next(t.value for t in app.dataframe if "Family" in t.value.columns)
+    assert len(table) == 65
+    assert table.Description.str.len().min() > 10
+    assert table["Why this model"].str.len().min() > 20
+    assert any("About this cause" in text.value for text in app.markdown)
+    for widget in [*app.multiselect, *app.selectbox]:
+        assert not set(widget.options) & set(INAPPLICABLE_MALE_CAUSES.values())
+    assert next(w for w in app.slider if w.label == "Declining-tail residual share").value == 0.25
+    custom = next(w for w in app.multiselect if w.label == "Causes with custom age trajectories")
+    custom.select(DEMENTIA_NAME).run()
+    next(w for w in app.number_input if w.label == f"Slowdown years for {DEMENTIA_NAME}").set_value(
+        40.0
+    ).run()
+    assert not app.exception
+    table = next(t.value for t in app.dataframe if "Family" in t.value.columns).set_index("Cause")
+    assert table.loc[DEMENTIA_NAME, "Slowdown (years, assumed)"] == 40
+    inspector = next(w for w in app.selectbox if w.label == "Inspect a cause trajectory")
+    linked_name = table.loc[table.Family == "linked"].index[0]
+    inspector.select(linked_name).run()
+    assert not app.exception
+    assert any("Reference group:" in item.value for item in app.caption)

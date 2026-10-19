@@ -2,9 +2,9 @@
 
 ## Mortality surface
 
-Let `r_c(a)` denote the interpolated 2021 rate for cause `c`, per 100,000. Closed five-year observations are interpolated across their age midpoints. All 95+ observations are excluded from every projection mode, calibration, trend fit and reference comparison. Raw snapshots remain unchanged. The last closed group's midpoint is 92 (90–94); source shares and time-trend slopes are held at that group beyond 92. Official all-cause calibration still varies through age 94. Independent age multipliers apply after 94.
+Let `r_c(a)` denote the interpolated 2021 rate for cause `c`, per 100,000. Closed five-year observations are interpolated across their age midpoints. All 95+ observations are excluded from every projection mode, calibration, trend fit and reference comparison. Raw snapshots remain unchanged. The last closed group's midpoint is 92 (90–94); source shares and time-trend slopes are held at that group beyond 92. Official all-cause calibration still varies through age 94. Direct causes receive their own age multipliers after 94; three reporting categories follow identified cause groups.
 
-The disjoint underlying-cause codes `F01_F03` and `G30` are summed into `F01_F03_G30` before fitting either age shapes or calendar trends. The simulator has 68 causes. This sums recorded causes of death; it does not infer incidence, prevalence or a clinical dementia diagnosis. Missing component cells are rejected rather than filled with zeros. The historical explorer preserves the two original series, excluding 95+.
+The disjoint underlying-cause codes `F01_F03` and `G30` are summed into `F01_F03_G30` before fitting either age shapes or calendar trends. The simulator has 65 causes. Cervical (`C53`), other uterine (`C54_C55`) and ovarian (`C56`) cancers are excluded from this male model and UI because all their source rates are zero. Male breast cancer and rare congenital/perinatal categories remain. Raw data are unchanged. This sums recorded causes of death; it does not infer incidence, prevalence or a clinical dementia diagnosis. Missing component cells are rejected rather than filled with zeros. The historical explorer preserves the two original series, excluding 95+.
 
 For calibrated projections, the total baseline rate is `100000 × Mx(a)` for ages 35–94, from the official Eurostat life table. Every cause receives the same age-specific factor:
 
@@ -18,34 +18,52 @@ Uncalibrated mode uses the source totals instead. It is included for comparison 
 
 ## Older ages
 
-The default model selects an individual trajectory for every cause. For `t = age - 94 >= 0`, each age-94 cause rate is multiplied by one of four simple shapes:
+The default family for each cause is a reviewed scenario prior in `cause_models.py`. Its description, rationale and provisional status accompany the curve in the UI and exports. For `x = age - 94 >= 0`:
 
-| Family | Multiplier | Free shape parameters |
+| Family | Multiplier | Parameters |
 |---|---|---|
-| Exponent | `exp(b*t)` | Nonnegative slope `b` |
-| Sigmoid | `R / (1 + (R - 1)*exp(-b*t))` | Slope `b`, asymptote ratio `R > 1` |
-| Plateau | `1` | None |
-| Decline | `exp(-b*t)` | Nonnegative slope `b` |
+| Slowing growth (P / `power`) | `(1 + x/tau) ** (b*tau)` | Initial log-slope `b >= 0`, slowdown `tau > 0` |
+| Bounded growth (B / `bounded`) | `exp(b*tau*(1-exp(-x/tau)))` | Initial log-slope `b >= 0`, slowdown `tau > 0` |
+| Flat (F / `plateau`) | `1` | None |
+| Decline with residual (D / `decline`) | `r + (1-r)*exp(-d*x)` | Decay parameter `d >= 0`, residual `0 <= r < 1` |
+| Exponent (comparison) | `exp(b*x)` | Nonnegative slope `b` |
+| Sigmoid (comparison) | `R / (1 + (R-1)*exp(-b*x))` | Slope `b`, ratio `R >= 1` |
 
-Every multiplier equals one at the splice. Causes evolve independently after 94; their sum is **not** rescaled to an external all-cause curve. Cause shares can therefore change with age. Calendar trends, COVID and interventions multiply each cause's own age curve. An optional declining-tail residual `r` replaces its multiplier with `r + (1-r)*exp(-b*t)`; the default is zero. This is a baseline age-shape assumption, distinct from the slow-intervention floor. Fast interventions can reduce even the residual to zero.
+Every multiplier equals one at the splice. Slowing growth has no ceiling; bounded growth approaches `exp(b*tau)` times the anchor. The defaults are **tau = 20 years** and **r = 0.25**, explicitly assumed rather than fitted. Slowdown is editable per cause; the declining residual is shared and editable in Mortality assumptions. No hazard ceiling of 1/year is imposed by these families. A flat positive rate continues accumulating deaths.
 
-### First-version shape selection
+There are 25 power, 24 bounded, 10 flat, 3 decline and 3 linked categories. The three zero-only cancer categories are removed instead of retaining zero curves. Independent causes are not renormalized to an external total after 94. Future treatment remains separate from the baseline age shapes and can reduce a declining residual further.
 
-Only pre-pandemic rates from 2011–2019 and closed groups 70–74 through 90–94 are used. The midpoint representation approximates group-average rates; it is not a single-age observation or exposure-weighted fit. The baseline level is separately anchored to 2021. No data from 95+ or 2020–2021 influence shape selection.
+### Parameter estimation and uncertainty
 
-1. Fewer than five complete, strictly positive years, an average rate below 5 per 100,000 in the last two groups, or fewer than 80% positive values in any group trigger an explicit plateau fallback. COVID also uses a fallback because it has no pre-pandemic series. These are pragmatic safeguards, not sampling-uncertainty estimates.
-2. A last-group mean below 97% of the preceding group, with a decline in at least 75% of complete years, selects a terminal declining branch. Its slope is the median yearly negative log-ratio divided by five, clipped to [0, 0.4]. Only the two terminal groups identify it. It has **no independent post-peak validation score**, and its continuation is labeled limited evidence. A residual share or a manual plateau provides a sensitivity alternative.
-3. Otherwise, compare plateau, exponent and sigmoid separately in each positive year: train on 70–84 and predict 85–89, then train on 70–89 and predict 90–94. Score each family by the mean across years of the two-point log-RMSE. The level is fitted separately in log space. Prefer the simpler family within 0.03 log units of the best score.
-4. A sigmoid must additionally reduce the exponent's score by at least 20% and be selected in at least two thirds of years. Otherwise choose plateau or exponent. Exponent slopes are clipped to [0, 0.4]; sigmoid grid search uses 45 slopes in [0.02, 0.4] and 55 asymptote ratios in [1.02, 50], logarithmically spaced. Grid ratios are relative to the last training midpoint, then transformed to the splice at 94.
-5. Refit the selected shape to the mean pre-pandemic profile. Record its nearest alternative, prediction scores, yearly agreement and limitations. A sigmoid's remote saturation level is uncertain even if its near-age predictions improve. Manual overrides retain the automatic alternative for comparison and clear the selected model's validation score.
+Only 2011–2019 closed groups below 95 inform age slopes. Baseline levels remain anchored to 2021. The midpoint representation approximates group-average rates, not single-age observations or exposure-weighted estimation.
 
-This is an auditable descriptive selector, not an epidemiological causal model. Adjacent years share cohorts and cannot be treated as independent replications. Selection scores do not give confidence intervals, and evidence below 95 cannot validate centuries-long extrapolation. Sparse series and rates without death counts/exposures limit what can be inferred. No onset or disease-duration model is introduced.
+- Growth slopes use a log-linear fit to the mean rates at midpoints 82, 87 and 92 (80–94), clipped to [0, 0.4].
+- Support requires at least five complete positive years, positive means, mean rate at least 5 per 100,000 over the last two groups, and at least 80% positive values in each of the five 70–94 groups. These are pragmatic safeguards, not uncertainty estimates.
+- For sparse growth causes with positive pooled means, use 25% own mean-profile slope plus 75% median of supported growing causes in the same registry group. Zeros remain in the mean; no pseudocount is added. Without a usable own slope, use the group median. Without a supported group, use the explicitly assumed 0.05/year slope.
+- All three COVID categories borrow the same supported infection-group median. No pre-pandemic COVID fit is claimed. Borrowing pools use the full available history, so requesting a subset of causes cannot change their parameters.
+- Declining causes use `g = max(0, -log(mean_90_94 / mean_85_89)/5)`, capped at 0.4, and `d = g/(1-0.25)`. This matches the initial decline with the default residual. Changing the residual also changes the initial slope; the stored decay parameter stays fixed. With unavailable positive terminal means the decay is zero and explicitly flagged.
+- Flat and linked families have no independently fitted age slope. A zero baseline cell stays zero unless the ordinary calendar model supplies risk; no positive baseline rate is invented by the age fitter.
 
-### Dementia scenario choice
+The family, 20-year slowdown, pooling weights, residuals and fallback slope are assumptions. Default families receive no validation score or claimed selection probability. Sparse and heterogeneous causes are labelled provisional. Death counts/exposures are absent, and survivor selection, cohort history and classification can affect age profiles. Life-extending interventions may change those patterns.
 
-For combined dementia, the primary tail explicitly uses an exponent fitted to the mean 2011–2019 profile in the four closed groups **70–74 through 85–89**. Its log-slope is 0.198014/year, corresponding to a doubling time of 3.50 years. The 90–94 group neither affects this slope nor determines whether enough data are available to fit it. The level at the splice remains anchored to the baseline 2021 surface, as for other causes.
+The earlier descriptive exponent/sigmoid/plateau selector remains available for unregistered synthetic/API causes and the dementia comparison. Its blocked-age scores concern prediction below 95, not validation of remote extrapolations.
 
-The previous sigmoid fitted at 70–94 is retained with its full parameters (slope 0.216741/year and age-94 asymptote ratio 1.528725), fit window and blocked-age score. It is shown as a comparison curve and can be selected as the active dementia scenario. Both choices are exported. The primary exponent is labeled **Scenario assumption**, with no automatic selection score or year-agreement claim. Better near-age prediction by the sigmoid does not validate its remote plateau. Other causes retain the selection procedure above.
+### Linked reporting categories (L)
+
+`R96-R99` and `R_OTH` follow identified natural causes. `Y10-Y34_Y872` follows identified external causes. Donor groups exclude all three reporting codes and any actively linked custom curves, so the dependency graph has no cycles.
+
+At each age through the boundary, derive `rho_i(a) = raw_i(a) / sum(raw_donors(a))` from the observed 2021 cause rates. These ratios are fixed in calendar time and held at the last closed midpoint after age 92, as are the other source shares. Then, in individual mode:
+
+```text
+linked_rate_i(a, year) = rho_i(a) * sum(projected_donor_rates(a, year))
+                         * explicit_intervention_i(year)
+```
+
+Donor rates already include age shape, calibration, calendar trends, COVID and donor interventions. The linked category's own calendar trend is replaced by donor trends. Applying this rule throughout the observed ages preserves the 2021 level and avoids a discontinuity at 94 in future calendar years. A direct intervention on a linked category is an additional multiplier, explained in the UI. Removing a donor reduces its linked reporting share but leaves other direct causes unchanged; no hazard is redistributed into other diseases. A positive reporting rate with no positive donor reference is rejected.
+
+### Dementia
+
+Combined dementia uses slowing growth with initial log-slope **0.1497565669/year**, estimated over 80–94, and assumed slowdown **20 years**. The earlier 70–94 sigmoid (slope 0.2167405741, age-94 asymptote ratio 1.528725466) remains a selectable comparison. Its log-RMSE 0.1165226056 measures blocked-age predictions below 95. Both are exported, and neither models disease incidence or prevalence.
 
 ### Common-curve comparators
 
@@ -68,7 +86,7 @@ The same procedures use source totals when calibration is disabled. In these thr
 
 The default secular fit uses 2011–2019, excluding all three COVID categories. It retains linear slopes whose individual 95% intervals exclude zero. Multiple-testing correction, temporal dependence, hierarchical shrinkage and predictive calibration remain future work. The historical explorer still fits whichever complete series it displays, including 2020–2021; that view is descriptive.
 
-For each cause, the source rate is advanced by `slope × elapsed`, where:
+For each direct cause (and each cause in common-curve comparison modes), the source rate is advanced by `slope × elapsed`, where:
 
 ```text
 elapsed = min(max(calendar_year - 2021, 0), trend_horizon_years)
@@ -104,13 +122,13 @@ suggested_fast_rate = 1 - 0.9 * exp(-b)
 one_year_net_factor = exp(b) * (1 - suggested_fast_rate) = 0.9
 ```
 
-This is multiplicative compensation, not addition of percentage points. `b` includes the selected slope multiplier and any custom curve. Dementia's default `b = 0.1980141115` gives a fast reduction of `0.2616775511`. The guarantee describes annual hazard changes after 94 during the fast stage with calendar factors fixed. Continuing secular trends, COVID transitions and source interpolation before 94 can alter the realized change. Plateau, sigmoid and declining families retain a 10% treatment default; common Gompertz mode compensates its shared exponential slope for every cause. Flat and common Kannisto modes have no positive exponential tails for this purpose.
+This is multiplicative compensation, not addition of percentage points. `b` includes the selected slope multiplier and any custom curve. The guarantee describes annual hazard changes after 94 during the fast stage with calendar factors fixed. Continuing secular trends, COVID transitions and source interpolation before 94 can alter the realized change. Power, bounded, plateau, sigmoid, declining and linked families retain a raw 10% treatment default; common Gompertz mode compensates its shared exponential slope for every cause. Flat and common Kannisto modes have no positive exponential tails for this purpose.
 
-Defaults update when an active shape changes only while the value remains automatic. Manual edits and imports retain their literal treatment reduction. An explicit reset applies the current suggestions. Untracked values from older sessions are preserved until reset. The bulk-selection button adds positive-slope exponential causes under the active model, preserving previous selections. Neither action changes CSV units or the intervention equations; assumptions JSON records both actual interventions and the suggested-rate policy.
+Defaults update when an active shape changes only while the value remains automatic. Manual edits and imports retain their literal treatment reduction. An explicit reset applies the current suggestions. Untracked values from older sessions are preserved until reset. The bulk-selection button adds all direct increasing causes (49 under the reviewed defaults), preserving previous selections. Neither action changes CSV units or the intervention equations; assumptions JSON records both actual interventions and the suggested-rate policy.
 
 Evaluation uses `log1p(-rate)` and a separate branch for a 100% annual reduction. The mortality calculation retains the log multiplier through its combination with ageing, avoiding premature underflow of tiny fast multipliers. All stages act on top of the chosen counterfactual; an intervention should represent progress additional to any historical extrapolation.
 
-Interventions are still uniform by age, without treatment uptake, adherence, disease states or correlated individual frailty. Changes in one cause do not directly modify another cause's hazard. Competing deaths nevertheless remain coupled through total survival.
+Interventions are still uniform by age, without treatment uptake, adherence, disease states or correlated individual frailty. Changes in one direct cause do not modify other direct causes; linked reporting categories inherit donor changes. Competing deaths nevertheless remain coupled through total survival.
 
 ## Survival and numerical horizon
 
@@ -134,7 +152,7 @@ Old-age hazards, cause scaling, COVID decay and intervention effects are combine
 
 For tail analysis, first advance to an anchor after time trends and all fast-stage transitions have finished, explicitly checking any intervening annual hazards. Thereafter each nonzero cause is a geometric sequence multiplied by its age curve. COVID fade is split into residual and decaying components. Declining curves with a residual similarly split into constant and decreasing terms; these splits combine when a COVID cause is assigned a declining curve.
 
-For plateau, sigmoid and common Kannisto ageing, the geometric log-growth is `log(1 - fast_rate)`, with an additional `-log(2)/half_life` for a fading COVID component. Exponent/Gompertz adds its positive ageing slope; a declining term subtracts its slope. Sigmoid hazards are nondecreasing and bounded between their current value and their individual asymptote. Non-decaying terms provide a conservative positive future hazard bound `h_min`, combined with the minimum across any years before the anchor. Thus:
+For power, bounded, plateau, sigmoid and common Kannisto ageing, the geometric log-growth is `log(1 - fast_rate)`, with an additional `-log(2)/half_life` for a fading COVID component. Exponent/Gompertz adds its positive ageing slope; a declining term subtracts its slope. Bounded and sigmoid hazards lie between their current rate and their asymptote. Power hazards are nondecreasing with a polynomial upper factor. Non-decaying terms provide a conservative positive future hazard bound `h_min`, combined with the minimum across any years before the anchor. Thus:
 
 ```text
 remaining integral <= S(H) / h_min
@@ -142,8 +160,10 @@ remaining integral <= S(H) / h_min
 
 This bound requires no frozen tail assumption. A finite mean is reported only when the omitted contribution is at most 0.001 years; otherwise it remains `None` / “Unresolved”.
 
-If every remaining component decays geometrically, or all have been eliminated, total future cumulative hazard is finite. Survival then has a positive limit and the full mean is analytically **infinite**, regardless of the integration horizon. This classification also accounts for Gompertz growth: fast improvements need to outpace ageing for all surviving terms. Zero numerical hazard at a distant age alone is not used as proof.
+If every remaining component has negative geometric log-growth (possibly multiplied by a polynomial), or all have been eliminated, total future cumulative hazard is finite. Survival then has a positive limit and the full mean is analytically **infinite**, regardless of the integration horizon. This classification also accounts for Gompertz growth: fast improvements need to outpace ageing for all surviving terms. Zero numerical hazard at a distant age alone is not used as proof.
 
 For a decreasing term `h(n) = c * exp(g*n)`, the cumulative hazard is `c / (1 - exp(g))`. Plateau, exponent and declining terms use this geometric sum directly. Sigmoids use their own asymptote/current ratio as an upper multiplier; common Kannisto uses its 1/year asymptote. Adding the pre-anchor hazard gives a conservative remaining cumulative-hazard bound `U`. Then `S(infinity) >= S(H) * exp(-U)`. Percentiles are marked infinite only when this lower survival bound proves they cannot be reached. A bound can underflow to zero while the structural proof of an infinite mean remains valid. Restricted life-years remain finite and comparable at a common horizon in all cases.
+
+For a power tail, the multiplier relative to a future anchor is `(1+n/s)**p`, where `p=b*tau` and `s=tau+anchor_age-94` (including the slope multiplier in `b`). With geometric growth `g<0`, choose `epsilon=min(-g/2,p/s)` and maximize `p*log(1+n/s)-epsilon*n` over `n>=0`. Its maximum occurs at `max(0,p/epsilon-s)`. This gives a finite exponential envelope with remaining growth `g+epsilon<0`, even if the treated hazard initially increases. The envelope is summed geometrically. A bounded curve uses its exact asymptote/current ratio. Linked categories copy donor components and add any own intervention multiplier and decay, so their bounds also include donor COVID and treatment effects.
 
 Sensitivity analysis compares deterministic alternative settings, using the same settings for the paired baseline and intervention and the same horizon for restricted means. These ranges are not probability intervals. No claim is made that a narrow sensitivity range demonstrates forecast accuracy.
